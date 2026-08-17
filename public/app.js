@@ -1,21 +1,52 @@
 /**
  * public/app.js
  * ----------------------------------------------------------------------------
- * Browser-side test console. It calls the exact same /api/ask endpoint the
- * iOS Shortcut calls, so if it works here it will work on your phone.
+ * Browser-side console, with the two-step login in front of it.
  *
- * No framework, no build step — this file is served as-is.
+ * Worth being clear about what this file does and doesn't do: hiding the
+ * console until you're signed in is a convenience, not the security boundary.
+ * The real boundary is server-side — /api/ask refuses to answer without a valid
+ * session cookie or the Shortcut key. This page holds no secrets, so it doesn't
+ * matter that anyone can read it.
+ *
+ * The session cookie is HttpOnly, so this script can't read it either. That's
+ * deliberate: it means an XSS bug can't steal your session. We ask the server
+ * "am I signed in?" via /api/session instead.
  */
 
 const $ = (id) => document.getElementById(id);
 
 const el = {
-  key: $('key'),
-  remember: $('remember'),
+  subtitle: $('subtitle'),
+  health: $('health'),
+  signout: $('signout'),
+
+  gate: $('gate'),
+  stepPassword: $('step-password'),
+  stepCode: $('step-code'),
+  password: $('password'),
+  passwordSubmit: $('password-submit'),
+  code: $('code'),
+  codeSubmit: $('code-submit'),
+  sentTo: $('sent-to'),
+  countdown: $('countdown'),
+  restart: $('restart'),
+  gateError: $('gate-error'),
+  gateNote: $('gate-note'),
+
+  console: $('console'),
+  tabAsk: $('tab-ask'),
+  tabHistory: $('tab-history'),
+  paneAsk: $('pane-ask'),
+  paneHistory: $('pane-history'),
+  search: $('search'),
+  refresh: $('refresh'),
+  historyMeta: $('history-meta'),
+  historyList: $('history-list'),
+
   question: $('question'),
   mic: $('mic'),
   send: $('send'),
-  health: $('health'),
   result: $('result'),
   title: $('r-title'),
   answer: $('r-answer'),
@@ -27,39 +58,184 @@ const el = {
 };
 
 const ENDPOINT = new URL('/api/ask', location.origin).toString();
-const STORE_KEY = 'oscar.key';
 
-/* ------------------------------------------------------------------ storage */
-// Wrapped because Safari private mode throws on localStorage access.
-const store = {
-  get() {
-    try {
-      return localStorage.getItem(STORE_KEY) || '';
-    } catch {
-      return '';
+/** `credentials: same-origin` so the session cookie rides along. */
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return { res, data };
+}
+
+/* ============================================================== login gate */
+
+let challenge = null;
+let countdownTimer = null;
+
+function showGateError(message) {
+  el.gateError.textContent = message;
+  el.gateError.hidden = !message;
+}
+
+function showGateNote(message) {
+  el.gateNote.textContent = message;
+  el.gateNote.hidden = !message;
+}
+
+function startCountdown(ms) {
+  clearInterval(countdownTimer);
+  let remaining = Math.floor(ms / 1000);
+
+  const tick = () => {
+    if (remaining <= 0) {
+      clearInterval(countdownTimer);
+      el.countdown.textContent = '0:00';
+      showGateError('That code expired. Start over.');
+      resetGate();
+      return;
     }
-  },
-  set(v) {
-    try {
-      if (v) localStorage.setItem(STORE_KEY, v);
-      else localStorage.removeItem(STORE_KEY);
-      return true;
-    } catch {
-      return false;
+    const m = Math.floor(remaining / 60);
+    const s = String(remaining % 60).padStart(2, '0');
+    el.countdown.textContent = `${m}:${s}`;
+    remaining--;
+  };
+
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+}
+
+function resetGate() {
+  clearInterval(countdownTimer);
+  challenge = null;
+  el.stepCode.hidden = true;
+  el.stepPassword.hidden = false;
+  el.code.value = '';
+  el.password.value = '';
+  el.password.focus();
+}
+
+el.stepPassword.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showGateError('');
+  showGateNote('');
+  el.passwordSubmit.disabled = true;
+  el.passwordSubmit.textContent = 'Sending…';
+
+  try {
+    const { res, data } = await api('/api/auth', {
+      action: 'start',
+      password: el.password.value,
+    });
+
+    if (!res.ok || !data.ok) {
+      showGateError(data.error || `Sign-in failed (HTTP ${res.status}).`);
+      return;
     }
-  },
-};
+
+    challenge = data.challenge;
+    el.sentTo.textContent = data.sentTo || 'your email';
+    el.stepPassword.hidden = true;
+    el.stepCode.hidden = false;
+    el.code.focus();
+    startCountdown(data.expiresInMs || 600000);
+
+    if (data.delivered === false) {
+      showGateNote(
+        'No email provider is configured yet, so the code was written to your Vercel ' +
+          'function logs instead (Vercel → your project → Logs). Set RESEND_API_KEY to ' +
+          'receive it by email.'
+      );
+    }
+  } catch (err) {
+    showGateError(String((err && err.message) || err));
+  } finally {
+    el.passwordSubmit.disabled = false;
+    el.passwordSubmit.textContent = 'Send code';
+  }
+});
+
+el.stepCode.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showGateError('');
+  el.codeSubmit.disabled = true;
+  el.codeSubmit.textContent = 'Checking…';
+
+  try {
+    const { res, data } = await api('/api/auth', {
+      action: 'verify',
+      challenge,
+      code: el.code.value,
+    });
+
+    if (!res.ok || !data.ok) {
+      showGateError(data.error || `Verification failed (HTTP ${res.status}).`);
+      el.code.select();
+      return;
+    }
+
+    clearInterval(countdownTimer);
+    await enterConsole(data.email);
+  } catch (err) {
+    showGateError(String((err && err.message) || err));
+  } finally {
+    el.codeSubmit.disabled = false;
+    el.codeSubmit.textContent = 'Verify';
+  }
+});
+
+el.restart.addEventListener('click', () => {
+  showGateError('');
+  showGateNote('');
+  resetGate();
+});
+
+// Uppercase as you type, and auto-submit once the code is complete — the code
+// is 6 characters, so waiting for a button press is just friction.
+el.code.addEventListener('input', () => {
+  const cleaned = el.code.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned !== el.code.value) el.code.value = cleaned;
+  if (cleaned.length === 6 && !el.codeSubmit.disabled) {
+    el.stepCode.requestSubmit();
+  }
+});
+
+el.signout.addEventListener('click', async () => {
+  await api('/api/auth', { action: 'logout' });
+  location.reload();
+});
+
+/* ============================================================ mode switching */
+
+async function enterConsole(email) {
+  el.gate.hidden = true;
+  el.console.hidden = false;
+  el.signout.hidden = false;
+  el.health.hidden = false;
+  el.subtitle.textContent = email
+    ? `Signed in as ${email}.`
+    : 'Signed in. This calls the same endpoint your Shortcut does.';
+  el.question.focus();
+  await checkHealth();
+}
+
+function showGate() {
+  el.gate.hidden = false;
+  el.console.hidden = true;
+  el.signout.hidden = true;
+  el.health.hidden = true;
+  el.subtitle.textContent = 'Sign in to continue.';
+  el.password.focus();
+}
 
 /* --------------------------------------------------------------------- init */
 
-function init() {
+async function init() {
   el.endpoint.textContent = ENDPOINT;
-
-  const saved = store.get();
-  if (saved) {
-    el.key.value = saved;
-    el.remember.classList.add('on');
-  }
 
   el.recipe.textContent = [
     'Get Contents of URL',
@@ -71,18 +247,24 @@ function init() {
     '    tz       (Text) : ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'),
   ].join('\n');
 
-  checkHealth();
+  try {
+    const { data } = await api('/api/session');
+    if (data.authed) await enterConsole(data.email);
+    else showGate();
+  } catch {
+    showGate();
+    showGateError('Could not reach the server.');
+  }
 }
 
 /* ------------------------------------------------------------------- health */
 
 async function checkHealth() {
   try {
-    const res = await fetch('/api/health', { cache: 'no-store' });
-    const data = await res.json();
-    if (data.config && data.config.openaiKey) {
+    const { data } = await api('/api/health');
+    if (data.agent && data.agent.openaiKey) {
       el.health.dataset.state = 'ok';
-      el.health.textContent = String(data.config.model).replace(' (default)', '');
+      el.health.textContent = String(data.agent.model).replace(' (default)', '');
     } else {
       el.health.dataset.state = 'bad';
       el.health.textContent = 'no API key';
@@ -122,42 +304,34 @@ async function ask() {
   const started = performance.now();
 
   try {
-    const res = await fetch(ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-oscar-key': el.key.value.trim(),
-      },
-      body: JSON.stringify({
-        question,
-        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      }),
+    const { res, data } = await api('/api/ask', {
+      question,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
     });
 
-    const data = await res.json().catch(() => ({
-      ok: false,
-      title: 'Oscar failed',
-      answer: `Server returned ${res.status} with an unreadable body.`,
-    }));
+    // The session expired while the page was open.
+    if (res.status === 401) {
+      showGate();
+      showGateError('Your session expired. Sign in again.');
+      return;
+    }
 
     const roundTrip = Math.round(performance.now() - started);
 
+    // A new row exists now, so the history tab should refetch next time it opens.
+    historyLoaded = false;
+
     render({
       ok: Boolean(data.ok),
-      title: data.title,
-      answer: data.answer,
+      title: data.title || 'Oscar failed',
+      answer: data.answer || `Server returned ${res.status}.`,
       detail: data.detail,
       meta: data.ok
         ? `${data.model || 'model'} · ${data.elapsedMs ?? '?'}ms model · ${roundTrip}ms round trip`
         : `HTTP ${res.status} · ${roundTrip}ms`,
     });
   } catch (err) {
-    render({
-      ok: false,
-      title: 'Network error',
-      answer: String((err && err.message) || err),
-      meta: '',
-    });
+    render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
   } finally {
     inFlight = false;
     el.send.disabled = false;
@@ -165,12 +339,152 @@ async function ask() {
   }
 }
 
-/* ------------------------------------------------------ dictation (optional) */
-// Uses the Web Speech API where it exists (Chrome, Safari). This is only for
-// convenience while testing in a browser — on the phone, Shortcuts does the
-// dictation natively and never touches this file.
+/* ============================================================ history tab */
 
-let recognizer = null;
+let historyLoaded = false;
+
+function showTab(which) {
+  const history = which === 'history';
+  el.tabAsk.classList.toggle('on', !history);
+  el.tabHistory.classList.toggle('on', history);
+  el.tabAsk.setAttribute('aria-selected', String(!history));
+  el.tabHistory.setAttribute('aria-selected', String(history));
+  el.paneAsk.hidden = history;
+  el.paneHistory.hidden = !history;
+
+  if (history && !historyLoaded) loadHistory();
+}
+
+/** Local time, and a relative hint for anything recent. */
+function formatWhen(iso) {
+  const when = new Date(iso);
+  const mins = Math.round((Date.now() - when.getTime()) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+  return when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/**
+ * Built with createElement rather than innerHTML on purpose: these strings come
+ * back from a database, and textContent can't be tricked into executing markup.
+ */
+function entryNode(row) {
+  const node = document.createElement('article');
+  node.className = `entry${row.ok ? '' : ' bad'}`;
+
+  const question = document.createElement('div');
+  question.className = 'entry-q';
+  question.textContent = row.question || '(empty)';
+
+  const answer = document.createElement('div');
+  answer.className = 'entry-a';
+  answer.textContent = row.ok ? row.answer || '' : row.error || 'failed';
+
+  const meta = document.createElement('div');
+  meta.className = 'entry-meta';
+
+  const bits = [
+    formatWhen(row.created_at),
+    row.source || row.via,
+    row.model,
+    row.total_ms ? `${row.total_ms}ms` : null,
+    row.total_tokens ? `${row.total_tokens} tokens` : null,
+  ].filter(Boolean);
+
+  for (const bit of bits) {
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = bit;
+    meta.appendChild(tag);
+  }
+
+  node.append(question, answer, meta);
+
+  if (row.detail) {
+    const detail = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'more';
+    summary.className = 'meta';
+    const body = document.createElement('div');
+    body.className = 'entry-a';
+    body.textContent = row.detail;
+    detail.append(summary, body);
+    node.insertBefore(detail, meta);
+  }
+
+  return node;
+}
+
+async function loadHistory() {
+  el.historyMeta.textContent = 'Loading…';
+  el.historyList.replaceChildren();
+
+  const params = new URLSearchParams({ limit: '50' });
+  const term = el.search.value.trim();
+  if (term) params.set('q', term);
+
+  try {
+    const { res, data } = await api(`/api/history?${params}`);
+
+    if (res.status === 401) {
+      showGate();
+      showGateError('Your session expired. Sign in again.');
+      return;
+    }
+
+    historyLoaded = true;
+
+    if (data.configured === false) {
+      el.historyMeta.textContent = '';
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent =
+        'No database configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel to start logging — see SUPABASE.md.';
+      el.historyList.appendChild(empty);
+      return;
+    }
+
+    if (!data.ok) {
+      el.historyMeta.textContent = data.error || 'Could not load history.';
+      return;
+    }
+
+    const rows = data.rows || [];
+    el.historyMeta.textContent = rows.length
+      ? `${rows.length} most recent${term ? ` matching “${term}”` : ''}`
+      : '';
+
+    if (!rows.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = term ? 'Nothing matches that search.' : 'Nothing logged yet. Ask something.';
+      el.historyList.appendChild(empty);
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    for (const row of rows) fragment.appendChild(entryNode(row));
+    el.historyList.appendChild(fragment);
+  } catch (err) {
+    el.historyMeta.textContent = String((err && err.message) || err);
+  }
+}
+
+// Debounced so typing doesn't fire a query per keystroke.
+let searchTimer = null;
+el.search.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadHistory, 300);
+});
+
+el.refresh.addEventListener('click', loadHistory);
+el.tabAsk.addEventListener('click', () => showTab('ask'));
+el.tabHistory.addEventListener('click', () => showTab('history'));
+
+/* ------------------------------------------------------ dictation (optional) */
+// Web Speech API where it exists (Chrome, Safari). Convenience for testing in a
+// browser — on the phone, Shortcuts does the dictation and never loads this file.
 
 function setupMic() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -180,7 +494,7 @@ function setupMic() {
     return;
   }
 
-  recognizer = new SR();
+  const recognizer = new SR();
   recognizer.lang = navigator.language || 'en-US';
   recognizer.interimResults = true;
   recognizer.continuous = false;
@@ -225,19 +539,6 @@ el.send.addEventListener('click', ask);
 
 el.question.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') ask();
-});
-
-el.remember.addEventListener('click', () => {
-  const on = el.remember.classList.toggle('on');
-  const wrote = store.set(on ? el.key.value.trim() : '');
-  if (!wrote) {
-    el.remember.classList.remove('on');
-    el.remember.title = 'This browser blocks local storage';
-  }
-});
-
-el.key.addEventListener('change', () => {
-  if (el.remember.classList.contains('on')) store.set(el.key.value.trim());
 });
 
 el.copy.addEventListener('click', async () => {

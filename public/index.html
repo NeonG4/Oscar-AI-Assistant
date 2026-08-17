@@ -4,11 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
-    <title>Oscar — voice agent test console</title>
-    <meta
-      name="description"
-      content="Test console for Oscar, the voice agent behind an iOS Shortcut."
-    />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Oscar</title>
     <link rel="stylesheet" href="./styles.css" />
     <link
       rel="icon"
@@ -21,72 +18,144 @@
         <div class="mark" aria-hidden="true"></div>
         <div>
           <h1>Oscar</h1>
-          <p class="sub">Voice agent test console — the same endpoint your Shortcut calls.</p>
+          <p class="sub" id="subtitle">Sign in to continue.</p>
         </div>
-        <span class="pill" id="health" data-state="unknown">checking…</span>
+        <span class="pill" id="health" data-state="unknown" hidden>checking…</span>
+        <button id="signout" class="ghost small" type="button" hidden>Sign out</button>
       </header>
 
-      <section class="card" aria-labelledby="ask-h">
-        <h2 id="ask-h" class="sr-only">Ask a question</h2>
+      <!-- ================= LOGIN ================= -->
+      <section class="card gate" id="gate" hidden aria-labelledby="gate-h">
+        <h2 id="gate-h">Sign in</h2>
 
-        <label class="field">
-          <span class="label">Shared key</span>
-          <span class="row">
+        <!-- step 1: password -->
+        <form id="step-password" class="step">
+          <label class="field">
+            <span class="label">Password</span>
             <input
-              id="key"
+              id="password"
               type="password"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="the value of OSCAR_SHARED_SECRET"
+              autocomplete="current-password"
+              placeholder="••••••••••••"
+              required
             />
-            <button id="remember" class="ghost" type="button" title="Keep this key in this browser">
-              remember
-            </button>
-          </span>
-        </label>
+          </label>
+          <p class="hint">
+            A one-time code will be emailed to the address configured on the server.
+          </p>
+          <div class="actions">
+            <button class="primary" type="submit" id="password-submit">Send code</button>
+          </div>
+        </form>
 
-        <label class="field">
-          <span class="label">Question</span>
-          <textarea
-            id="question"
-            rows="3"
-            placeholder="Ask anything — press Cmd/Ctrl + Enter to send"
-          ></textarea>
-        </label>
+        <!-- step 2: emailed code -->
+        <form id="step-code" class="step" hidden>
+          <label class="field">
+            <span class="label">Code sent to <span id="sent-to">your email</span></span>
+            <input
+              id="code"
+              type="text"
+              inputmode="latin"
+              autocomplete="one-time-code"
+              autocapitalize="characters"
+              spellcheck="false"
+              maxlength="9"
+              placeholder="A1B2C3"
+              class="code-input"
+              required
+            />
+          </label>
+          <p class="hint">
+            Expires in <span id="countdown">10:00</span>.
+            <button type="button" class="linky" id="restart">Start over</button>
+          </p>
+          <div class="actions">
+            <button class="primary" type="submit" id="code-submit">Verify</button>
+          </div>
+        </form>
 
-        <div class="actions">
-          <button id="mic" class="ghost" type="button" title="Dictate (Chrome/Safari)">
-            <span class="dot" aria-hidden="true"></span> Speak
+        <p class="alert" id="gate-error" hidden role="alert"></p>
+        <p class="alert warn" id="gate-note" hidden></p>
+      </section>
+
+      <!-- ================= CONSOLE ================= -->
+      <div id="console" hidden>
+        <nav class="tabs" role="tablist">
+          <button class="tab on" id="tab-ask" role="tab" aria-selected="true" type="button">
+            Ask
           </button>
-          <button id="send" class="primary" type="button">Ask Oscar</button>
-        </div>
-      </section>
+          <button class="tab" id="tab-history" role="tab" aria-selected="false" type="button">
+            History
+          </button>
+        </nav>
 
-      <section class="card result" id="result" hidden aria-live="polite">
-        <div class="notif">
-          <div class="notif-app">OSCAR · now</div>
-          <div class="notif-title" id="r-title"></div>
-          <div class="notif-body" id="r-answer"></div>
-        </div>
-        <p class="detail" id="r-detail" hidden></p>
-        <p class="meta" id="r-meta"></p>
-      </section>
+        <div id="pane-ask">
+        <section class="card" aria-labelledby="ask-h">
+          <h2 id="ask-h" class="sr-only">Ask a question</h2>
 
-      <section class="card recipe">
-        <h2>Shortcut recipe</h2>
-        <p class="sub">
-          Build this in the Shortcuts app, then say “Hey Siri, Ask Oscar”. Full walkthrough is in
-          <code>SHORTCUT.md</code>.
-        </p>
-        <ol class="steps">
-          <li><b>Dictate Text</b> — Language: your language, Stop Listening: After Pause</li>
-          <li><b>Get Contents of URL</b> — the box below</li>
-          <li><b>Get Dictionary Value</b> — key <code>answer</code> in <i>Contents of URL</i></li>
-          <li><b>Show Notification</b> — body <i>Dictionary Value</i>, sound off</li>
-        </ol>
-        <pre class="code" id="recipe"></pre>
-        <button id="copy" class="ghost" type="button">Copy endpoint URL</button>
-      </section>
+          <label class="field">
+            <span class="label">Question</span>
+            <textarea
+              id="question"
+              rows="3"
+              placeholder="Ask anything — press Cmd/Ctrl + Enter to send"
+            ></textarea>
+          </label>
+
+          <div class="actions">
+            <button id="mic" class="ghost" type="button" title="Dictate (Chrome/Safari)">
+              <span class="dot" aria-hidden="true"></span> Speak
+            </button>
+            <button id="send" class="primary" type="button">Ask Oscar</button>
+          </div>
+        </section>
+
+        <section class="card result" id="result" hidden aria-live="polite">
+          <div class="notif">
+            <div class="notif-app">OSCAR · now</div>
+            <div class="notif-title" id="r-title"></div>
+            <div class="notif-body" id="r-answer"></div>
+          </div>
+          <p class="detail" id="r-detail" hidden></p>
+          <p class="meta" id="r-meta"></p>
+        </section>
+
+        <section class="card recipe">
+          <h2>Shortcut recipe</h2>
+          <p class="sub">
+            The Shortcut authenticates with the <code>x-oscar-key</code> header instead of this
+            login, because Shortcuts can't read your email. Full walkthrough in
+            <code>SHORTCUT.md</code>.
+          </p>
+          <ol class="steps">
+            <li><b>Dictate Text</b> — Stop Listening: After Pause</li>
+            <li><b>Get Contents of URL</b> — the box below</li>
+            <li><b>Get Dictionary Value</b> — key <code>answer</code> in <i>Contents of URL</i></li>
+            <li><b>Show Notification</b> — body <i>Dictionary Value</i></li>
+          </ol>
+          <pre class="code" id="recipe"></pre>
+          <button id="copy" class="ghost" type="button">Copy endpoint URL</button>
+        </section>
+        </div>
+
+        <!-- ================= HISTORY ================= -->
+        <div id="pane-history" hidden>
+          <section class="card">
+            <div class="row">
+              <input
+                id="search"
+                type="search"
+                placeholder="Search your questions…"
+                autocomplete="off"
+              />
+              <button id="refresh" class="ghost" type="button" title="Reload">Refresh</button>
+            </div>
+            <p class="meta" id="history-meta">Loading…</p>
+          </section>
+
+          <div id="history-list" class="history"></div>
+        </div>
+      </div>
 
       <footer class="foot">
         <span id="endpoint"></span>

@@ -10,72 +10,49 @@
  *   200 -> { "ok": true, "title": "...", "answer": "...", "detail": "...", ... }
  *   4xx/5xx -> { "ok": false, "title": "Oscar failed", "answer": "<why>" }
  *
+ * TWO WAYS IN, because the two callers have different constraints:
+ *
+ *   1. `x-oscar-key` header — for the Shortcut. Shortcuts can't check an email
+ *      inbox, so it uses a long shared secret that lives on your phone.
+ *   2. Login session cookie — for the browser console, set by /api/auth after
+ *      the password + emailed code.
+ *
  * Errors deliberately return the same shape as success, because the Shortcut
- * reads `answer` and shows it in a notification either way. That way a failure
+ * reads `answer` and shows it in a notification either way. A failure then
  * shows up on your lock screen as readable text instead of silently doing
  * nothing.
  *
- * GET is also supported (`/api/ask?q=...&key=...`) purely so you can sanity
- * check the deployment from a browser.
+ * Every request is logged to Supabase when it's configured — successes and
+ * failures both. See lib/db.js for why logging can never break an answer.
  */
 
 import { askAgent, AgentError } from '../lib/agent.js';
+import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
+import { applyCors, readBody, send, HttpError } from '../lib/http.js';
+import { logConversation, conversationRow } from '../lib/db.js';
 
-const MAX_BODY_BYTES = 64 * 1024;
+/**
+ * @returns {'session'|'key'|null} how this request authenticated, if at all.
+ */
+function authenticate(req, url, body) {
+  if (getSession(req)) return 'session';
 
-/** Constant-time-ish string compare so the secret can't be probed by timing. */
-function safeEqual(a, b) {
-  const x = String(a ?? '');
-  const y = String(b ?? '');
-  if (x.length !== y.length) return false;
-  let diff = 0;
-  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
-  return diff === 0;
-}
+  const expected = process.env.OSCAR_SHARED_SECRET;
+  if (!expected) return null;
 
-/** Vercel usually parses the body for us; fall back to reading the stream. */
-async function readBody(req) {
-  if (req.body !== undefined && req.body !== null && req.body !== '') {
-    if (typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return req.body;
-    const asText = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body);
-    try {
-      return JSON.parse(asText);
-    } catch {
-      return { question: asText };
-    }
-  }
+  const provided =
+    req.headers['x-oscar-key'] ||
+    url.searchParams.get('key') ||
+    body.key ||
+    (typeof req.headers.authorization === 'string'
+      ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+      : '');
 
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new AgentError('Request body too large.', 413);
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-
-  const text = Buffer.concat(chunks).toString('utf8');
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Plain-text body: treat the whole thing as the question. Handy if you'd
-    // rather not build a dictionary inside Shortcuts.
-    return { question: text };
-  }
-}
-
-function send(res, status, payload) {
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.setHeader('cache-control', 'no-store');
-  res.end(JSON.stringify(payload));
+  return safeEqual(provided, expected) ? 'key' : null;
 }
 
 export default async function handler(req, res) {
-  // CORS, so the bundled web console (and any other page you own) can call this.
-  res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-methods', 'POST, GET, OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type, x-oscar-key');
+  applyCors(req, res);
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -90,31 +67,37 @@ export default async function handler(req, res) {
     });
   }
 
+  const startedAt = Date.now();
+
+  // Declared out here so the catch block can still log what was being asked.
+  let question = '';
+  let timeZone;
+  let via = null;
+  let source = null;
+
   try {
     const url = new URL(req.url, 'http://localhost');
     const body = req.method === 'POST' ? await readBody(req) : {};
 
     // ---- auth -------------------------------------------------------------
-    const expected = process.env.OSCAR_SHARED_SECRET;
-    if (expected) {
-      const provided =
-        req.headers['x-oscar-key'] ||
-        url.searchParams.get('key') ||
-        body.key ||
-        (typeof req.headers.authorization === 'string'
-          ? req.headers.authorization.replace(/^Bearer\s+/i, '')
-          : '');
-      if (!safeEqual(provided, expected)) {
-        return send(res, 401, {
-          ok: false,
-          title: 'Oscar failed',
-          answer: 'That key is not right. Check the x-oscar-key header in the Shortcut.',
-        });
-      }
+    via = authenticate(req, url, body);
+    if (!via) {
+      await penaltyDelay(250);
+      return send(res, 401, {
+        ok: false,
+        title: 'Oscar failed',
+        answer: process.env.OSCAR_SHARED_SECRET
+          ? 'Not authorised. Sign in on the website, or check the x-oscar-key header in the Shortcut.'
+          : 'Server is missing OSCAR_SHARED_SECRET, so nothing can authenticate.',
+        detail: '',
+        speak: 'Not authorised.',
+      });
+      // Note: unauthorised requests are deliberately NOT logged. Otherwise
+      // anyone who finds the URL could fill your database for free.
     }
 
     // ---- input ------------------------------------------------------------
-    const question =
+    question =
       body.question ||
       body.q ||
       body.text ||
@@ -122,10 +105,26 @@ export default async function handler(req, res) {
       url.searchParams.get('question') ||
       '';
 
-    const timeZone =
-      body.tz || body.timeZone || url.searchParams.get('tz') || undefined;
+    timeZone = body.tz || body.timeZone || url.searchParams.get('tz') || undefined;
+    source = body.source || (via === 'key' ? 'shortcut' : 'console');
 
     const result = await askAgent({ question, timeZone }, { env: process.env });
+
+    // Awaited on purpose: on serverless the function can be frozen the instant
+    // a response is sent, so a fire-and-forget insert would vanish some of the
+    // time. ~50-150ms against a multi-second request is a fair price for a log
+    // you can trust. lib/db.js no-ops when Supabase isn't configured.
+    await logConversation(
+      conversationRow({
+        question,
+        timeZone,
+        result,
+        status: 200,
+        via,
+        source,
+        totalMs: Date.now() - startedAt,
+      })
+    );
 
     return send(res, 200, {
       ok: true,
@@ -134,22 +133,42 @@ export default async function handler(req, res) {
       answer: result.answer,
       detail: result.detail,
       // `speak` is what you feed into a "Speak Text" action if you want it read
-      // aloud: title + answer merged, since the title carries context.
+      // aloud: answer + detail merged.
       speak: result.detail ? `${result.answer} ${result.detail}` : result.answer,
       model: result.model,
       elapsedMs: result.elapsedMs,
+      via,
     });
   } catch (err) {
-    const status = err instanceof AgentError ? err.status : 500;
+    const status = err instanceof AgentError || err instanceof HttpError ? err.status : 500;
     const message =
-      err instanceof AgentError ? err.message : 'Something broke on the server.';
+      err instanceof AgentError || err instanceof HttpError
+        ? err.message
+        : 'Something broke on the server.';
+    const full = err && err.detail ? `${message} (${err.detail})` : message;
 
     if (status >= 500) console.error('[oscar] ', err);
+
+    // Failures are logged too. A table recording only successes hides exactly
+    // what you need when something breaks.
+    if (via) {
+      await logConversation(
+        conversationRow({
+          question,
+          timeZone,
+          error: full,
+          status,
+          via,
+          source,
+          totalMs: Date.now() - startedAt,
+        })
+      );
+    }
 
     return send(res, status, {
       ok: false,
       title: 'Oscar failed',
-      answer: err && err.detail ? `${message} (${err.detail})` : message,
+      answer: full,
       detail: '',
       speak: message,
     });

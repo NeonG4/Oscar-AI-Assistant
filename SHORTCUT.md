@@ -6,6 +6,13 @@ notification a few seconds later.
 You need your deployed URL (e.g. `https://oscar-xyz.vercel.app`) and your
 `OSCAR_SHARED_SECRET` value. Have both in front of you.
 
+> **Why the Shortcut doesn't use the website login.** The website asks for a
+> password and then a code emailed to you. A Shortcut can't read your inbox, so
+> it authenticates with the `x-oscar-key` header instead. That secret is
+> equivalent to your password — anyone with it can spend your OpenAI credit —
+> but it can't be used to get a website session. Rotate it in Vercel if a phone
+> goes missing.
+
 ---
 
 ## The shortcut, action by action
@@ -133,7 +140,7 @@ notification rather than a silent no-op.
 
 | What you see                            | Cause                                                            |
 | --------------------------------------- | ---------------------------------------------------------------- |
-| Notification says "That key is not right"| `x-oscar-key` header doesn't match `OSCAR_SHARED_SECRET` on Vercel |
+| Notification says "Not authorised"       | `x-oscar-key` header doesn't match `OSCAR_SHARED_SECRET` on Vercel |
 | Notification says "missing OPENAI_API_KEY"| Env var not set in Vercel, or set but not redeployed             |
 | "insufficient_quota"                     | OpenAI account needs credit                                       |
 | Shortcut errors before any notification  | Usually the JSON body field is empty — recheck step 2             |

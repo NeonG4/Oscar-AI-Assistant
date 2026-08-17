@@ -1,0 +1,256 @@
+# Oscar
+
+Talk to your phone, get an answer back as a notification.
+
+You say *"Hey Siri, Ask Oscar"*, speak a question, and a few seconds later a
+notification appears with the answer. Under the hood it's an iOS Shortcut
+posting your dictated text to a tiny Vercel function, which asks an OpenAI model
+for an answer written to fit on a lock screen.
+
+```
+ iPhone                          Vercel                    OpenAI
+ ──────                          ──────                    ──────
+ "Hey Siri, Ask Oscar"
+   → Dictate Text
+   → POST /api/ask  ─────────▶  api/ask.js
+       x-oscar-key header         auth + parse
+                                  lib/agent.js  ─────────▶  chat completion
+                                                            (JSON: title,
+                                  ◀───────────────────────   answer, detail)
+   ◀────── { title, answer } ──  200 OK
+   → Show Notification
+
+
+ Browser                         Vercel
+ ───────                         ──────
+   → password  ──────────────▶  api/auth.js  ──▶ emails you a 6-char code
+   ◀── signed challenge token
+   → challenge + code  ──────▶  api/auth.js  ──▶ Set-Cookie: signed session
+   → /api/ask with cookie
+```
+
+## What's in here
+
+| File                | Role                                                                     |
+| ------------------- | ------------------------------------------------------------------------ |
+| `api/ask.js`        | The endpoint the Shortcut hits. Accepts a session cookie **or** the key.  |
+| `api/auth.js`       | Login: password → emailed code → session cookie. Also logout.             |
+| `api/session.js`    | "Am I signed in?" — the page asks this on load.                          |
+| `api/history.js`    | Reads back the log. Session login only — not the Shortcut key.            |
+| `api/health.js`     | `GET /api/health` — confirms your env vars landed. Never echoes them.     |
+| `lib/agent.js`      | The agent: prompt, model call, cleanup. No HTTP, so it's testable.        |
+| `lib/auth.js`       | Signed tokens, code generation, cookies, constant-time comparisons.       |
+| `lib/mailer.js`     | Sends the code. Auto-detects Resend / Postmark / SendGrid.                |
+| `lib/http.js`       | Body parsing, JSON replies, CORS rules.                                   |
+| `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
+| `db/schema.sql`     | The table, indexes and RLS lockdown. Paste into Supabase's SQL editor.    |
+| `public/index.html` | Login screen, ask console, and history tab.                                |
+| `public/styles.css` | All the styling.                                                          |
+| `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
+| `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
+| `test/smoke.js`     | 63 dependency-free tests, including the security rules. `npm test`.       |
+| `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
+| `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
+| `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
+
+## Setup
+
+### 1. Get an OpenAI key
+
+<https://platform.openai.com/api-keys>. Add a few dollars of credit — the
+default model (`gpt-4o-mini`) costs a fraction of a cent per question, so $5
+lasts a very long time at conversational volume.
+
+### 2. Get an email sending key
+
+Sign up at **[Resend](https://resend.com)** and make an API key. Their
+`onboarding@resend.dev` sender delivers to your own account email with no domain
+setup, so this takes about two minutes.
+
+Postmark and SendGrid work too — set `POSTMARK_TOKEN` or `SENDGRID_API_KEY`
+instead and `lib/mailer.js` picks up whichever it finds. If you set none of
+them, the code is printed to your Vercel function logs, which is enough to sign
+in and try everything before committing to a provider.
+
+### 3. Deploy
+
+```bash
+npm i -g vercel
+vercel login
+vercel          # first deploy, creates the project
+vercel --prod   # promote to your permanent URL
+```
+
+There is nothing to `npm install` — no runtime dependencies. Vercel serves
+`public/` as the site root and turns each file in `api/` into a function.
+
+### 4. Set environment variables
+
+In **Vercel → your project → Settings → Environment Variables**:
+
+| Name                  | Required | Value                                                       |
+| --------------------- | :------: | ----------------------------------------------------------- |
+| `OPENAI_API_KEY`      |    ✅    | your OpenAI key                                              |
+| `OSCAR_PASSKEY`       |    ✅    | the password you'll type on the website                      |
+| `OSCAR_OWNER_EMAIL`   |    ✅    | where sign-in codes get emailed                              |
+| `OSCAR_SHARED_SECRET` |    ✅    | the Shortcut's credential — `openssl rand -hex 24`           |
+| `OSCAR_SESSION_SECRET`|    ▲    | signs login sessions — `openssl rand -hex 32`                |
+| `RESEND_API_KEY`      |    ▲    | (or `POSTMARK_TOKEN` / `SENDGRID_API_KEY`)                   |
+| `OPENAI_MODEL`        |          | defaults to `gpt-4o-mini`                                    |
+| `OSCAR_MAX_WORDS`     |          | answer length cap, default `60`                              |
+| `OSCAR_PERSONA`       |          | standing instructions, see below                             |
+| `OSCAR_PASSKEY_HASH`  |          | sha256 hex, instead of `OSCAR_PASSKEY`                       |
+
+▲ = strongly recommended. Add `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+for logging — see [SUPABASE.md](./SUPABASE.md).
+
+**[ENV.md](./ENV.md) documents every variable in depth**, including step-by-step
+instructions for obtaining each key and what breaks without it.
+
+**Redeploy after adding them** (`vercel --prod`) — env vars are baked in at
+deploy time.
+
+Then open `https://your-app.vercel.app/api/health`. Everything under `auth`
+should read `true`, and `mailProvider` should not say `"log"`. Add `?deep=1` to
+also test the database connection once you've set it up.
+
+### 5. Sign in and test
+
+Open `https://your-app.vercel.app`, enter your password, then the code from your
+email. The console behind the login calls the same endpoint your Shortcut will.
+Debug here, not on the phone.
+
+### 6. Build the Shortcut
+
+Follow **[SHORTCUT.md](./SHORTCUT.md)** — four actions, about three minutes.
+
+### 7. Optional: turn on logging
+
+Follow **[SUPABASE.md](./SUPABASE.md)** — about ten minutes. You get a
+searchable record of every question, real cost and latency numbers, and the
+**History** tab in the console. Everything works without it.
+
+## Local development
+
+```bash
+cp .env.example .env.local   # fill in your keys
+npm start                    # http://localhost:3000, plain Node
+# or: vercel dev             # closer to production routing
+npm test                     # no network, no keys needed
+```
+
+Use `http://localhost:3000` rather than your LAN IP — session cookies are
+marked `Secure`, and browsers only keep those over HTTPS or on localhost.
+
+`npm test` runs both handlers end to end against a fake OpenAI and a fake mail
+provider, including the auth rules: forged tokens, expired sessions, replayed
+challenges, wrong codes, CORS. Change anything security-relevant and run it.
+
+---
+
+## How the login works
+
+Two callers, two credentials, because they have different constraints:
+
+- **The website** uses a password plus a code emailed to you. Both are required;
+  the password alone gets you nothing but an email.
+- **The Shortcut** uses the `x-oscar-key` header. It has to — a Shortcut can't
+  check your inbox for a code. Treat that secret as equivalent to the password:
+  anyone holding it can spend your OpenAI credit, but they cannot get a website
+  session with it.
+
+There is **no database**. Both the mid-login challenge and the finished session
+are HMAC-signed tokens: the server re-computes the signature with
+`OSCAR_SESSION_SECRET` to verify them, so it doesn't need to have stored
+anything. Specifically:
+
+- The emailed code is never stored anywhere. The challenge token holds only an
+  HMAC of it, so intercepting the token doesn't reveal the code.
+- The challenge is bound to the browser that asked for it, so a stolen token
+  can't be redeemed elsewhere.
+- The session cookie is `HttpOnly` (page scripts can't read it, so an XSS bug
+  can't steal it), `Secure`, and `SameSite=Lax` (not sent on cross-site
+  requests, which is what stops CSRF).
+- Codes are 6 characters from a 32-symbol alphabet with no ambiguous glyphs —
+  about 1.07 billion combinations, valid for 10 minutes.
+- CORS never reflects a foreign origin with credentials, so another website
+  can't ride your session.
+
+**Rotating a secret is your "log out everywhere" button.** Change
+`OSCAR_SESSION_SECRET` and redeploy: every browser session dies instantly and
+the Shortcut is unaffected. Change `OSCAR_SHARED_SECRET` and the Shortcut needs
+its header updated.
+
+### What this does not protect
+
+Worth being straight about, since "only I can access it" is the goal:
+
+- **The static page is public.** Hiding the console until you sign in is
+  convenience. Anyone can read `index.html`, `app.js` and `styles.css` — they
+  contain no secrets, and every route that does anything checks auth server-side.
+- **`/api/health` is public** by design, reporting booleans only. It's what you
+  need when you're locked out and trying to work out why.
+- **Going stateless costs two things**: a code remains valid for its full
+  10-minute window even after you've used it, and there's no lockout after N
+  bad attempts. Guessing a code blind is ~1 in a billion per try and you'd need
+  the password first, so this is a reasonable trade for a personal tool — but
+  it *is* a trade.
+- **Your email account is now part of your security.** Whoever can read your
+  inbox can complete a login, given the password.
+
+### Hardening further
+
+- **True one-time codes and lockouts** need somewhere to record used codes and
+  failed attempts. Add Vercel KV or Upstash Redis, store the challenge `jti` on
+  use, and reject replays in `verifyChallenge`.
+- **Face ID / Touch ID login** is the thing "passkey" usually means —
+  [WebAuthn](https://webauthn.guide/) passkeys. It's a genuinely better fit for
+  a personal tool than a password, and it would replace both factors here. It
+  needs a place to store the credential's public key, so pair it with the KV
+  step above.
+- **Vercel's own protections** — Deployment Protection or Vercel Authentication
+  in project settings — can put a second gate in front of the whole deployment,
+  including static files, if you want the page itself hidden.
+- **Rotate `OSCAR_SHARED_SECRET`** occasionally, since it lives in plain text
+  inside a Shortcut on your phone.
+
+---
+
+## Tuning the agent
+
+Everything about the agent's voice lives in `buildSystemPrompt()` in
+`lib/agent.js`. The constraints there exist for notification-specific reasons:
+
+- **Word cap** — iOS truncates a notification banner at roughly 3–4 lines.
+- **No markdown** — asterisks and hashes render literally in a notification.
+- **No "Great question!" openers** — you're reading this at a glance.
+- **Expect transcription errors** — the input came from speech, not typing.
+
+For per-user preferences use `OSCAR_PERSONA` rather than editing code, e.g.
+`Answer in metric. I live in Seattle. I'm a software engineer, so skip basic explanations.`
+
+## Cost
+
+Vercel's free tier plus a cheap model makes this effectively free for personal
+use. Resend and Supabase free tiers cover far more than a personal tool needs.
+Once logging is on, `select sum(total_tokens) from conversations` tells you
+exactly what you've spent instead of guessing.
+
+## Where to take it next
+
+- **Speak the answer** — feed the `speak` field into a **Speak Text** action so
+  length stops mattering. Consider sending a `mode` field so the word cap
+  relaxes when you're listening rather than glancing.
+- **Learn about you** — extract durable facts from the `conversations` table on
+  a schedule, store them, inject them into the prompt. See the end of
+  [SUPABASE.md](./SUPABASE.md) for the shape, including the part everyone gets
+  wrong (retiring facts that stop being true).
+- **Conversation memory** — give the Shortcut a session id, store turns in
+  the same database, prepend them in `askAgent`.
+- **Tools** — add OpenAI function calling in `lib/agent.js` (web search, your
+  calendar, a notes API) and loop until the model stops asking for tools.
+- **Long-running answers** — if you add tools, replies can exceed what a
+  Shortcut will politely wait for. Return a job id immediately, then push the
+  real answer via [ntfy.sh](https://ntfy.sh) or Pushcut.
+- **Follow-ups** — swap *Show Notification* for *Ask for Input* in a **Repeat**
+  loop to get a back-and-forth conversation.
