@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Oscar — voice agent test console</title>
+    <meta
+      name="description"
+      content="Test console for Oscar, the voice agent behind an iOS Shortcut."
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8E%99%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="head">
+        <div class="mark" aria-hidden="true"></div>
+        <div>
+          <h1>Oscar</h1>
+          <p class="sub">Voice agent test console — the same endpoint your Shortcut calls.</p>
+        </div>
+        <span class="pill" id="health" data-state="unknown">checking…</span>
+      </header>
+
+      <section class="card" aria-labelledby="ask-h">
+        <h2 id="ask-h" class="sr-only">Ask a question</h2>
+
+        <label class="field">
+          <span class="label">Shared key</span>
+          <span class="row">
+            <input
+              id="key"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="the value of OSCAR_SHARED_SECRET"
+            />
+            <button id="remember" class="ghost" type="button" title="Keep this key in this browser">
+              remember
+            </button>
+          </span>
+        </label>
+
+        <label class="field">
+          <span class="label">Question</span>
+          <textarea
+            id="question"
+            rows="3"
+            placeholder="Ask anything — press Cmd/Ctrl + Enter to send"
+          ></textarea>
+        </label>
+
+        <div class="actions">
+          <button id="mic" class="ghost" type="button" title="Dictate (Chrome/Safari)">
+            <span class="dot" aria-hidden="true"></span> Speak
+          </button>
+          <button id="send" class="primary" type="button">Ask Oscar</button>
+        </div>
+      </section>
+
+      <section class="card result" id="result" hidden aria-live="polite">
+        <div class="notif">
+          <div class="notif-app">OSCAR · now</div>
+          <div class="notif-title" id="r-title"></div>
+          <div class="notif-body" id="r-answer"></div>
+        </div>
+        <p class="detail" id="r-detail" hidden></p>
+        <p class="meta" id="r-meta"></p>
+      </section>
+
+      <section class="card recipe">
+        <h2>Shortcut recipe</h2>
+        <p class="sub">
+          Build this in the Shortcuts app, then say “Hey Siri, Ask Oscar”. Full walkthrough is in
+          <code>SHORTCUT.md</code>.
+        </p>
+        <ol class="steps">
+          <li><b>Dictate Text</b> — Language: your language, Stop Listening: After Pause</li>
+          <li><b>Get Contents of URL</b> — the box below</li>
+          <li><b>Get Dictionary Value</b> — key <code>answer</code> in <i>Contents of URL</i></li>
+          <li><b>Show Notification</b> — body <i>Dictionary Value</i>, sound off</li>
+        </ol>
+        <pre class="code" id="recipe"></pre>
+        <button id="copy" class="ghost" type="button">Copy endpoint URL</button>
+      </section>
+
+      <footer class="foot">
+        <span id="endpoint"></span>
+      </footer>
+    </main>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>

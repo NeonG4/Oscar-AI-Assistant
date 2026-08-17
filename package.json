@@ -1,0 +1,24 @@
+{
+  "name": "oscar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Voice-driven AI agent for iOS Shortcuts. Speak a question, get an answer as a notification.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "check": "node --check api/ask.js && node --check lib/agent.js && node --check public/app.js",
+    "test": "node test/smoke.js"
+  },
+  "keywords": [
+    "ios",
+    "shortcuts",
+    "siri",
+    "openai",
+    "vercel"
+  ],
+  "license": "MIT"
+}
