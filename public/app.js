@@ -17,11 +17,14 @@
 const $ = (id) => document.getElementById(id);
 
 const el = {
+  viewLoading: $('view-loading'),
+  viewLogin: $('view-login'),
+  viewApp: $('view-app'),
+
   subtitle: $('subtitle'),
   health: $('health'),
   signout: $('signout'),
 
-  gate: $('gate'),
   stepPassword: $('step-password'),
   stepCode: $('step-code'),
   password: $('password'),
@@ -34,7 +37,6 @@ const el = {
   gateError: $('gate-error'),
   gateNote: $('gate-note'),
 
-  console: $('console'),
   tabAsk: $('tab-ask'),
   tabHistory: $('tab-history'),
   paneAsk: $('pane-ask'),
@@ -205,39 +207,66 @@ el.code.addEventListener('input', () => {
 });
 
 el.signout.addEventListener('click', async () => {
+  el.signout.disabled = true;
   await api('/api/auth', { action: 'logout' });
-  location.reload();
+  resetGate();
+  showGateError('');
+  showGateNote('');
+  showGate();
+  el.signout.disabled = false;
 });
 
-/* ============================================================ mode switching */
+/* ============================================================ view switching */
+
+/**
+ * The page has exactly three states, and this is the only thing that changes
+ * them. Everything else calls setState() rather than toggling elements itself
+ * — which is what guarantees the console cannot be on screen while signed out.
+ *
+ * `hidden` handles it for assistive tech and for JS-driven changes; the
+ * matching CSS rules on body[data-state] handle it before JS has even run.
+ *
+ * @param {'loading'|'out'|'in'} state
+ */
+function setState(state) {
+  document.body.dataset.state = state;
+  el.viewLoading.hidden = state !== 'loading';
+  el.viewLogin.hidden = state !== 'out';
+  el.viewApp.hidden = state !== 'in';
+}
 
 async function enterConsole(email) {
-  el.gate.hidden = true;
-  el.console.hidden = false;
-  el.signout.hidden = false;
-  el.health.hidden = false;
+  setState('in');
   el.subtitle.textContent = email
     ? `Signed in as ${email}.`
     : 'Signed in. This calls the same endpoint your Shortcut does.';
+
+  // Populated only now, so the endpoint URL never appears on the login screen.
+  el.endpoint.textContent = ENDPOINT;
+  el.recipe.textContent = recipeText();
+
   el.question.focus();
   await checkHealth();
 }
 
 function showGate() {
-  el.gate.hidden = false;
-  el.console.hidden = true;
-  el.signout.hidden = true;
-  el.health.hidden = true;
-  el.subtitle.textContent = 'Sign in to continue.';
+  setState('out');
+
+  // Clear anything the app view had rendered, so a signed-out page holds no
+  // trace of the previous session even before a reload.
+  el.endpoint.textContent = '';
+  el.recipe.textContent = '';
+  el.historyList.replaceChildren();
+  el.result.hidden = true;
+  historyLoaded = false;
+
   el.password.focus();
 }
 
 /* --------------------------------------------------------------------- init */
 
-async function init() {
-  el.endpoint.textContent = ENDPOINT;
-
-  el.recipe.textContent = [
+function recipeText() {
+  return [
     'Get Contents of URL',
     `  URL     ${ENDPOINT}`,
     '  Method  POST',
@@ -246,6 +275,10 @@ async function init() {
     '    question (Text) : Dictated Text',
     '    tz       (Text) : ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'),
   ].join('\n');
+}
+
+async function init() {
+  setState('loading');
 
   try {
     const { data } = await api('/api/session');

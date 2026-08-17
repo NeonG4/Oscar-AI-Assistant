@@ -32,6 +32,16 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute must always win.
+   Browsers implement it as `[hidden] { display: none }` in the UA stylesheet,
+   which any class selector outranks. Since this file sets `display` on .card,
+   .step and the tab panes, those elements would stay visible even when marked
+   hidden — showing both login steps at once, an empty result card, and both
+   tabs stacked. One rule fixes all of it. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -43,14 +53,76 @@ body {
   color: var(--text);
   font: 15px/1.55 ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
-  padding: 32px 18px 64px;
+  margin: 0;
+  min-height: 100dvh;
 }
 
+/* ---------- view switching ----------
+   `hidden` is set by app.js, but these rules enforce the same thing from CSS
+   so the app view can never flash before JavaScript has run. */
+
+#view-loading,
+#view-login,
+#view-app {
+  display: none;
+}
+
+body[data-state="loading"] #view-loading,
+body[data-state="out"] #view-login,
+body[data-state="in"] #view-app {
+  display: grid;
+}
+
+/* The app: a normal top-aligned page. */
 .shell {
   max-width: 640px;
   margin: 0 auto;
-  display: grid;
+  padding: 32px 18px 64px;
   gap: 18px;
+}
+
+/* The login: centred in the viewport, nothing else on the page.
+   dvh rather than vh so the mobile keyboard doesn't shove the card off screen. */
+.login-shell {
+  min-height: 100dvh;
+  place-items: center;
+  padding: 24px 18px;
+}
+
+/* ---------- boot / loading ---------- */
+
+.boot {
+  min-height: 100dvh;
+  place-items: center;
+  align-content: center;
+  gap: 14px;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.boot-text {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.4s;
+  }
 }
 
 /* ---------- header ---------- */
@@ -338,9 +410,29 @@ code {
 /* ---------- login gate ---------- */
 
 .gate {
-  max-width: 420px;
   width: 100%;
-  margin: 8px auto 0;
+  max-width: 380px;
+  padding: 24px;
+  gap: 16px;
+  box-shadow: var(--shadow);
+}
+
+/* Login-screen branding — the app header does not exist in this state. */
+.brand {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 2px;
+}
+
+.brand h1 {
+  font-size: 18px;
+}
+
+.wide {
+  width: 100%;
+  padding: 11px 16px;
 }
 
 .step {

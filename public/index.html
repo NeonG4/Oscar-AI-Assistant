@@ -12,21 +12,40 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8E%99%3C/text%3E%3C/svg%3E"
     />
   </head>
-  <body>
-    <main class="shell">
-      <header class="head">
-        <div class="mark" aria-hidden="true"></div>
-        <div>
-          <h1>Oscar</h1>
-          <p class="sub" id="subtitle">Sign in to continue.</p>
-        </div>
-        <span class="pill" id="health" data-state="unknown" hidden>checking…</span>
-        <button id="signout" class="ghost small" type="button" hidden>Sign out</button>
-      </header>
 
-      <!-- ================= LOGIN ================= -->
-      <section class="card gate" id="gate" hidden aria-labelledby="gate-h">
-        <h2 id="gate-h">Sign in</h2>
+  <!--
+    The page has exactly three states, and `data-state` on <body> is the single
+    source of truth for which one is showing:
+
+      loading  — we haven't heard back from /api/session yet
+      out      — signed out: ONLY the login card exists on the page
+      in       — signed in: the full console
+
+    Views are hidden with the `hidden` attribute (set by app.js) *and* by CSS
+    keyed off data-state. The belt-and-braces matters: it means the app view
+    can never flash into visibility before JavaScript runs.
+  -->
+  <body data-state="loading">
+    <!-- ===================== LOADING ===================== -->
+    <!-- Without this, both views are hidden while /api/session resolves, and
+         the page looks broken for a moment on a slow connection. -->
+    <div class="boot" id="view-loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="boot-text">Checking your session…</p>
+    </div>
+
+    <!-- ====================== LOGIN ====================== -->
+    <!-- Deliberately self-contained: its own branding, no app header, no
+         footer, no endpoint URL. Nothing here hints at what's behind it. -->
+    <main class="login-shell" id="view-login" hidden>
+      <section class="card gate" aria-labelledby="gate-h">
+        <div class="brand">
+          <div class="mark" aria-hidden="true"></div>
+          <div>
+            <h1 id="gate-h">Oscar</h1>
+            <p class="sub">Sign in to continue</p>
+          </div>
+        </div>
 
         <!-- step 1: password -->
         <form id="step-password" class="step">
@@ -40,12 +59,8 @@
               required
             />
           </label>
-          <p class="hint">
-            A one-time code will be emailed to the address configured on the server.
-          </p>
-          <div class="actions">
-            <button class="primary" type="submit" id="password-submit">Send code</button>
-          </div>
+          <p class="hint">A one-time code will be emailed to you.</p>
+          <button class="primary wide" type="submit" id="password-submit">Send code</button>
         </form>
 
         <!-- step 2: emailed code -->
@@ -69,27 +84,37 @@
             Expires in <span id="countdown">10:00</span>.
             <button type="button" class="linky" id="restart">Start over</button>
           </p>
-          <div class="actions">
-            <button class="primary" type="submit" id="code-submit">Verify</button>
-          </div>
+          <button class="primary wide" type="submit" id="code-submit">Verify</button>
         </form>
 
         <p class="alert" id="gate-error" hidden role="alert"></p>
         <p class="alert warn" id="gate-note" hidden></p>
       </section>
+    </main>
 
-      <!-- ================= CONSOLE ================= -->
-      <div id="console" hidden>
-        <nav class="tabs" role="tablist">
-          <button class="tab on" id="tab-ask" role="tab" aria-selected="true" type="button">
-            Ask
-          </button>
-          <button class="tab" id="tab-history" role="tab" aria-selected="false" type="button">
-            History
-          </button>
-        </nav>
+    <!-- ======================= APP ======================= -->
+    <main class="shell" id="view-app" hidden>
+      <header class="head">
+        <div class="mark" aria-hidden="true"></div>
+        <div>
+          <h1>Oscar</h1>
+          <p class="sub" id="subtitle">Signed in.</p>
+        </div>
+        <span class="pill" id="health" data-state="unknown">checking…</span>
+        <button id="signout" class="ghost small" type="button">Sign out</button>
+      </header>
 
-        <div id="pane-ask">
+      <nav class="tabs" role="tablist">
+        <button class="tab on" id="tab-ask" role="tab" aria-selected="true" type="button">
+          Ask
+        </button>
+        <button class="tab" id="tab-history" role="tab" aria-selected="false" type="button">
+          History
+        </button>
+      </nav>
+
+      <!-- ---------------------- ask ---------------------- -->
+      <div id="pane-ask">
         <section class="card" aria-labelledby="ask-h">
           <h2 id="ask-h" class="sr-only">Ask a question</h2>
 
@@ -136,25 +161,24 @@
           <pre class="code" id="recipe"></pre>
           <button id="copy" class="ghost" type="button">Copy endpoint URL</button>
         </section>
-        </div>
+      </div>
 
-        <!-- ================= HISTORY ================= -->
-        <div id="pane-history" hidden>
-          <section class="card">
-            <div class="row">
-              <input
-                id="search"
-                type="search"
-                placeholder="Search your questions…"
-                autocomplete="off"
-              />
-              <button id="refresh" class="ghost" type="button" title="Reload">Refresh</button>
-            </div>
-            <p class="meta" id="history-meta">Loading…</p>
-          </section>
+      <!-- -------------------- history -------------------- -->
+      <div id="pane-history" hidden>
+        <section class="card">
+          <div class="row">
+            <input
+              id="search"
+              type="search"
+              placeholder="Search your questions…"
+              autocomplete="off"
+            />
+            <button id="refresh" class="ghost" type="button" title="Reload">Refresh</button>
+          </div>
+          <p class="meta" id="history-meta">Loading…</p>
+        </section>
 
-          <div id="history-list" class="history"></div>
-        </div>
+        <div id="history-list" class="history"></div>
       </div>
 
       <footer class="foot">
