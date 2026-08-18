@@ -17,6 +17,8 @@ import { detectProvider } from '../lib/mailer.js';
 import { isConfigured, pingDatabase } from '../lib/db.js';
 import { isGoogleConfigured, canWriteGoogle } from '../lib/google/auth.js';
 import { availableTools } from '../lib/tools/index.js';
+import { routerModels, isRoutingEnabled } from '../lib/router.js';
+import { selfUrl } from '../lib/jobs.js';
 
 export default async function handler(req, res) {
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -63,6 +65,17 @@ export default async function handler(req, res) {
           webTyped: env.OSCAR_CONFIRM_ALWAYS === '1',
           webDictated: true,
           alsoConfirmsSending: env.OSCAR_CONFIRM_SEND === '1',
+        },
+        routing: {
+          enabled: isRoutingEnabled(env),
+          ...routerModels(env),
+        },
+        jobs: {
+          // Background work needs the database to checkpoint into.
+          available: isConfigured(env),
+          // Without a base URL a job cannot hand off to a fresh invocation, so
+          // it only advances while the web app is open and polling.
+          selfContinue: Boolean(selfUrl(env)),
         },
         plans: {
           // Plans live in Supabase, so they need the database, not Google.

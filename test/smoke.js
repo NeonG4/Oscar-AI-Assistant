@@ -8,7 +8,15 @@
 
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { askAgent, clampWords, parseModelPayload, AgentError } from '../lib/agent.js';
+import {
+  askAgent,
+  agentLimits,
+  createAgentState,
+  runAgentStep,
+  clampWords,
+  parseModelPayload,
+  AgentError,
+} from '../lib/agent.js';
 import {
   createChallenge,
   createSession,
@@ -89,7 +97,16 @@ import {
   deletePlanTool,
   listPlansTool,
 } from '../lib/tools/plans.js';
+import { quickClassify, routeQuestion, routerModels, isRoutingEnabled } from '../lib/router.js';
+import {
+  createJobToken,
+  readJobToken,
+  selfUrl,
+  MAX_JOB_STEPS,
+} from '../lib/jobs.js';
 import askHandler from '../api/ask.js';
+import stepHandler from '../api/step.js';
+import jobsHandler from '../api/jobs.js';
 import confirmHandler from '../api/confirm.js';
 import historyHandler from '../api/history.js';
 import authHandler from '../api/auth.js';
@@ -185,6 +202,9 @@ function setEnv(overrides = {}) {
   delete process.env.OSCAR_PASSKEY_HASH;
   // Write authority and Google config must never leak between tests — a stale
   // OSCAR_ALLOW_WRITES would make the write-gate tests pass for the wrong reason.
+  // Routing spends a model call BEFORE the agent's, which would shift every
+  // scripted fake sequence by one. Tests that care about routing turn it on.
+  process.env.OSCAR_DISABLE_ROUTING = '1';
   delete process.env.OSCAR_ALLOW_WRITES;
   delete process.env.OSCAR_WRITE_SECRET;
   delete process.env.GOOGLE_CLIENT_ID;
@@ -1231,19 +1251,162 @@ await test('the tool result is fed back as a tool message', async () => {
   assert.match(toolMsg.content, /Portland/);
 });
 
-await test('tools are withheld on the final round so the model must answer', async () => {
+await test('tools are withheld once the round budget runs out', async () => {
   const bodies = [];
-  // One tool call per allowed round, so the loop actually reaches the last one.
-  const inner = fakeOpenAIWithTools([WEATHER_CALL, WEATHER_CALL, WEATHER_CALL, FINAL]);
+  // Always asks for a tool, so only the budget can stop it.
+  const inner = fakeOpenAIWithTools([WEATHER_CALL]);
   const fetchImpl = async (url, init) => {
     if (String(url).includes('openai')) bodies.push(JSON.parse(init.body));
     return inner(url, init);
   };
-  const out = await askAgent({ question: 'weather?' }, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl });
+
+  await assert.rejects(
+    () => askAgent({ question: 'weather?' },
+      { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl, limits: { maxRounds: 3 } }),
+    /kept calling tools/,
+    'a model that never answers must eventually be stopped'
+  );
 
   assert.ok(bodies[0].tools, 'first round should offer tools');
-  assert.equal(bodies[bodies.length - 1].tools, undefined, 'last round must not offer tools');
+  assert.equal(bodies[3].tools, undefined, 'tools must be withheld once the budget is spent');
+  assert.match(
+    JSON.stringify(bodies[3].messages),
+    /no more tool calls available/,
+    'and the model should be told why'
+  );
+});
+
+await test('the round budget is far more generous than it used to be', async () => {
+  assert.ok(agentLimits({}).maxRounds >= 10,
+    'the agent should be able to chain many tools, not two');
+  assert.equal(agentLimits({ OSCAR_MAX_TOOL_ROUNDS: '5' }).maxRounds, 5);
+  assert.equal(agentLimits({}, { maxRounds: 2 }).maxRounds, 2, 'callers can override');
+});
+
+await test('a long chain of tool calls is allowed to run', async () => {
+  // Nine tool rounds then an answer — well past the old limit of three.
+  const steps = Array.from({ length: 9 }, (_, i) => ({
+    role: 'assistant', content: null,
+    tool_calls: [{ id: `c${i}`, type: 'function',
+      function: { name: 'get_weather', arguments: `{"place":"City${i}"}` } }],
+  }));
+  const inner = fakeOpenAIWithTools([...steps, FINAL]);
+  const out = await askAgent({ question: 'compare nine cities' },
+    { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner });
+
+  assert.equal(out.toolsUsed.length, 9, 'all nine calls should have run');
+  assert.equal(out.rounds, 10);
   assert.match(out.answer, /Overcast/);
+});
+
+await test('the wall-clock deadline stops a long run', async () => {
+  const bodies = [];
+  const inner = fakeOpenAIWithTools([WEATHER_CALL]);
+  const fetchImpl = async (url, init) => {
+    if (String(url).includes('openai')) bodies.push(JSON.parse(init.body));
+    return inner(url, init);
+  };
+
+  // Zero budget: tools must be withheld immediately on the second round.
+  await assert.rejects(
+    () => askAgent({ question: 'weather?' },
+      { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl, limits: { deadlineMs: 0, maxRounds: 50 } }),
+    /kept calling tools/
+  );
+  assert.equal(bodies[1].tools, undefined, 'past the deadline, no more tools are offered');
+});
+
+await test('a third identical tool call is refused, not executed', async () => {
+  const repeat = {
+    role: 'assistant', content: null,
+    tool_calls: [{ id: 'same', type: 'function',
+      function: { name: 'get_weather', arguments: '{"place":"Portland"}' } }],
+  };
+  let weatherCalls = 0;
+  const inner = fakeOpenAIWithTools([repeat, repeat, repeat, FINAL]);
+  const fetchImpl = async (url, init) => {
+    if (String(url).includes('openai')) return inner(url, init);
+    // NB: "geocoding-api.open-meteo.com" also contains "api.open-meteo.com",
+    // so match the forecast path specifically or every run counts twice.
+    if (String(url).includes('/v1/forecast')) weatherCalls++;
+    return fakeWorld()(url, init);
+  };
+
+  const out = await askAgent({ question: 'weather?' }, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl });
+  assert.ok(weatherCalls <= 2, `the same call must not run a third time (ran ${weatherCalls})`);
+  assert.match(out.answer, /Overcast/);
+});
+
+await test('the total tool-call budget is enforced', async () => {
+  const inner = fakeOpenAIWithTools([WEATHER_CALL]);
+  await assert.rejects(
+    () => askAgent({ question: 'weather?' },
+      { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner,
+        limits: { maxToolCalls: 2, maxRounds: 50 } }),
+    /kept calling tools/
+  );
+});
+
+section('the agent stepper');
+
+await test('runAgentStep does exactly one round and hands state back', async () => {
+  const state = createAgentState({ question: 'weather?' }, { OPENAI_API_KEY: 'sk-test' });
+  assert.equal(state.round, 0);
+
+  const inner = fakeOpenAIWithTools([WEATHER_CALL, FINAL]);
+  const first = await runAgentStep(state, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner });
+
+  assert.equal(first.status, 'working', 'a tool call means there is more to do');
+  assert.equal(first.state.round, 1);
+  assert.deepEqual(first.state.toolsUsed, ['get_weather']);
+  assert.ok(first.state.events.length, 'it should record what it did');
+
+  const second = await runAgentStep(first.state, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner });
+  assert.equal(second.status, 'done');
+  assert.match(second.result.answer, /Overcast/);
+});
+
+await test('agent state survives a JSON round trip', async () => {
+  // This is the property the whole stepped design rests on: state has to be
+  // storable in a database between function invocations.
+  const state = createAgentState({ question: 'weather?', coords: { latitude: 1, longitude: 2 } },
+    { OPENAI_API_KEY: 'sk-test' });
+  const inner = fakeOpenAIWithTools([WEATHER_CALL, FINAL]);
+
+  const first = await runAgentStep(state, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner });
+  const revived = JSON.parse(JSON.stringify(first.state));
+
+  const second = await runAgentStep(revived, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: inner });
+  assert.equal(second.status, 'done', 'a revived state must continue exactly as before');
+  assert.match(second.result.answer, /Overcast/);
+});
+
+await test('a pending confirmation stops the stepper', async () => {
+  // G_ENV is declared later in this file, so spell it out locally.
+  const env = {
+    GOOGLE_CLIENT_ID: 'client-id',
+    GOOGLE_CLIENT_SECRET: 'client-secret',
+    GOOGLE_REFRESH_TOKEN: 'refresh-token',
+    OPENAI_API_KEY: 'sk-test',
+    OSCAR_ALLOW_WRITES: '1',
+  };
+  clearTokenCache();
+
+  const state = createAgentState({ question: 'delete the standup', canWrite: true }, env);
+  const deleteCall = {
+    role: 'assistant', content: null,
+    tool_calls: [{ id: 'c1', type: 'function',
+      function: { name: 'delete_event', arguments: '{"id":"e1"}' } }],
+  };
+  const inner = fakeOpenAIWithTools([deleteCall, FINAL]);
+  const google = fakeGoogle();
+  const fetchImpl = async (url, init) =>
+    String(url).includes('openai') ? inner(url, init) : google(url, init);
+
+  const out = await runAgentStep(state, { env, fetchImpl });
+  assert.equal(out.status, 'confirm');
+  assert.ok(out.result.pendingConfirmation);
+  assert.ok(!google.calls.some((c) => c.method === 'DELETE'), 'nothing deleted yet');
 });
 
 await test('a failing tool still produces an answer', async () => {
@@ -2470,6 +2633,353 @@ await test('creating a plan needs write permission', async () => {
     env: { ...P_ENV, OSCAR_ALLOW_WRITES: '1' }, canWrite: false, fetchImpl: fakePlansDb(),
   });
   assert.match(out.error, /write permission/);
+});
+
+
+/* ================================================================ routing */
+section('model routing');
+
+const R_ENV = { OPENAI_API_KEY: 'sk-test', OSCAR_FAST_MODEL: 'fast-m', OSCAR_DEEP_MODEL: 'deep-m' };
+
+await test('obvious lookups are classified without a model call', () => {
+  for (const q of [
+    'what is the tallest building in Chicago',
+    'where are goats from',
+    'is it going to rain',
+    'how many ounces in a pound',
+  ]) {
+    assert.equal(quickClassify(q), 'fast', `"${q}" should be fast`);
+  }
+});
+
+await test('obvious projects are classified without a model call', () => {
+  for (const q of [
+    'build me a plan for working out',
+    'help me organise my move',
+    'write me a story about pigeons',
+    'draft a letter to my landlord',
+  ]) {
+    assert.equal(quickClassify(q), 'deep', `"${q}" should be deep`);
+  }
+});
+
+await test('very long questions are treated as deep', () => {
+  assert.equal(quickClassify('x '.repeat(200)), 'deep');
+});
+
+await test('unclear questions fall through to the classifier', () => {
+  assert.equal(quickClassify('pigeons and their migratory habits in urban settings'), null);
+});
+
+await test('the keyword path spends no model call at all', async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls++; throw new Error('should not be called'); };
+  const out = await routeQuestion('what is the capital of Peru', { env: R_ENV, fetchImpl });
+  assert.equal(out.mode, 'fast');
+  assert.equal(out.via, 'keyword');
+  assert.equal(out.model, 'fast-m');
+  assert.equal(calls, 0, 'the whole point of the shortcut is skipping the call');
+});
+
+await test('the classifier is consulted only when unclear', async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    return { ok: true, status: 200, text: async () =>
+      JSON.stringify({ choices: [{ message: { content: 'deep' } }] }) };
+  };
+  const out = await routeQuestion('pigeons and their migratory habits in urban settings',
+    { env: R_ENV, fetchImpl });
+  assert.equal(calls, 1);
+  assert.equal(out.mode, 'deep');
+  assert.equal(out.via, 'model');
+  assert.equal(out.model, 'deep-m');
+});
+
+await test('the classifier is asked for one word only', async () => {
+  let sent = null;
+  const fetchImpl = async (url, init) => {
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 200, text: async () =>
+      JSON.stringify({ choices: [{ message: { content: 'fast' } }] }) };
+  };
+  await routeQuestion('pigeons and their migratory habits in urban settings', { env: R_ENV, fetchImpl });
+  assert.ok(sent.max_tokens <= 5, 'the reply must be tiny or the latency is not worth it');
+  assert.equal(sent.temperature, 0);
+});
+
+await test('a broken classifier falls back to fast rather than failing', async () => {
+  const fetchImpl = async () => { throw new Error('router is down'); };
+  const out = await routeQuestion('pigeons and their migratory habits in urban settings',
+    { env: R_ENV, fetchImpl });
+  assert.equal(out.mode, 'fast');
+  assert.equal(out.via, 'default', 'routing is an optimisation, never a dependency');
+});
+
+await test('the mode can be forced, skipping routing entirely', async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls++; throw new Error('no'); };
+  const deep = await routeQuestion('what is 2+2', { env: R_ENV, fetchImpl, mode: 'deep' });
+  assert.equal(deep.mode, 'deep');
+  assert.equal(deep.via, 'forced');
+  assert.equal(calls, 0);
+});
+
+await test('routing can be switched off', async () => {
+  const out = await routeQuestion('build me a plan for working out',
+    { env: { ...R_ENV, OSCAR_DISABLE_ROUTING: '1' } });
+  assert.equal(out.mode, 'fast');
+  assert.equal(isRoutingEnabled({ OSCAR_DISABLE_ROUTING: '1' }), false);
+});
+
+await test('model names come from env with sane defaults', () => {
+  const m = routerModels({});
+  assert.ok(m.fast && m.deep && m.router);
+  assert.equal(routerModels({ OSCAR_DEEP_MODEL: 'x' }).deep, 'x');
+});
+
+/* =================================================================== jobs */
+section('job tokens');
+
+await test('a job token authorises exactly one job', () => {
+  const env = { OSCAR_SESSION_SECRET: SECRET };
+  const token = createJobToken('job-abc', env);
+  assert.equal(readJobToken(token, env), 'job-abc');
+});
+
+await test('a job token is refused for a different job', () => {
+  const env = { OSCAR_SESSION_SECRET: SECRET };
+  assert.notEqual(readJobToken(createJobToken('job-abc', env), env), 'job-xyz');
+});
+
+await test('a forged or expired job token is refused', () => {
+  const env = { OSCAR_SESSION_SECRET: SECRET };
+  assert.equal(readJobToken('nonsense.token', env), null);
+  assert.equal(readJobToken(createJobToken('j', env, Date.now() - 20 * 60 * 1000), env), null);
+  assert.equal(readJobToken(createJobToken('j', { OSCAR_SESSION_SECRET: 'other' }), env), null);
+});
+
+await test('selfUrl prefers an explicit base and falls back to Vercel', () => {
+  assert.equal(selfUrl({ OSCAR_BASE_URL: 'https://a.com/' }), 'https://a.com');
+  assert.equal(selfUrl({ VERCEL_URL: 'x.vercel.app' }), 'https://x.vercel.app');
+  assert.equal(selfUrl({}), null, 'locally there is nothing to hand off to');
+});
+
+section('the job lifecycle');
+
+/** Fake Supabase that actually stores jobs, so state really round-trips. */
+function fakeJobsDb() {
+  const state = { jobs: [] };
+  const fn = async (url, init = {}) => {
+    const href = String(url);
+    const method = init.method || 'GET';
+    const path = href.split('/rest/v1/')[1] || '';
+    const [table, query = ''] = path.split('?');
+    const params = new URLSearchParams(query);
+    const body = init.body ? JSON.parse(init.body) : null;
+    const json = (d, st = 200) => ({ ok: true, status: st, text: async () => JSON.stringify(d) });
+
+    if (table !== 'jobs') return json([], 200);
+    const idOf = () => (params.get('id') || '').replace('eq.', '');
+
+    if (method === 'POST') {
+      const row = { id: `job-${state.jobs.length + 1}`, status: 'queued', steps: 0, events: [],
+        created_at: 'now', ...body };
+      state.jobs.push(row);
+      return json([row], 201);
+    }
+    if (method === 'PATCH') {
+      const id = idOf();
+      state.jobs = state.jobs.map((j) => (j.id === id ? { ...j, ...body } : j));
+      return json(null, 204);
+    }
+    const id = idOf();
+    return json(id ? state.jobs.filter((j) => j.id === id) : state.jobs);
+  };
+  fn.state = state;
+  return fn;
+}
+
+const J_ENV = {
+  OPENAI_API_KEY: 'sk-test',
+  OSCAR_SESSION_SECRET: SECRET,
+  SUPABASE_URL: 'https://j.supabase.co',
+  SUPABASE_SERVICE_ROLE_KEY: 'k',
+  OSCAR_SHARED_SECRET: 'letmein',
+};
+
+function applyEnv(env) {
+  setEnv(env);
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  // These tests are specifically about routing, so switch it back on.
+  delete process.env.OSCAR_DISABLE_ROUTING;
+}
+
+await test('a deep question returns a job id immediately instead of an answer', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : fakeOpenAIWithTools([FINAL])(url, init);
+
+  const res = fakeRes();
+  await askHandler(fakeReq({
+    headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' },
+  }), res);
+
+  const data = res.json();
+  assert.equal(data.async, true, 'deep work must not block the caller');
+  assert.ok(data.jobId);
+  assert.ok(data.jobToken, 'the caller needs a token to poll its own job');
+  assert.equal(data.mode, 'deep');
+  assert.match(data.answer, /Working on/, 'an unchanged Shortcut still shows something sensible');
+  assert.equal(jobsDb.state.jobs.length, 1);
+  assert.ok(jobsDb.state.jobs[0].state, 'the agent state must be checkpointed at creation');
+});
+
+await test('a simple question still answers inline', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : fakeOpenAIWithTools([FINAL])(url, init);
+
+  const res = fakeRes();
+  await askHandler(fakeReq({
+    headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'what is the tallest building in Chicago' },
+  }), res);
+
+  const data = res.json();
+  assert.equal(data.async, false);
+  assert.equal(data.mode, 'fast');
+  assert.match(data.answer, /Overcast/);
+  assert.equal(jobsDb.state.jobs.length, 0, 'no job should be created for a lookup');
+});
+
+await test('async can be declined per request', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : fakeOpenAIWithTools([FINAL])(url, init);
+
+  const res = fakeRes();
+  await askHandler(fakeReq({
+    headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out', async: false },
+  }), res);
+
+  assert.equal(res.json().async, false, 'the caller can insist on waiting');
+  assert.equal(jobsDb.state.jobs.length, 0);
+});
+
+await test('deep work degrades to synchronous when there is no database', async () => {
+  applyEnv({ ...J_ENV, SUPABASE_URL: '', SUPABASE_SERVICE_ROLE_KEY: '' });
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  globalThis.fetch = fakeOpenAIWithTools([FINAL]);
+
+  const res = fakeRes();
+  await askHandler(fakeReq({
+    headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' },
+  }), res);
+
+  const data = res.json();
+  assert.equal(data.async, false, 'no database means answer inline rather than fail');
+  assert.match(data.answer, /Overcast/);
+});
+
+await test('a step advances the job and finishes it', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  const openai = fakeOpenAIWithTools([FINAL]);
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : openai(url, init);
+
+  // Create the job through the real path.
+  const askRes = fakeRes();
+  await askHandler(fakeReq({ headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' } }), askRes);
+  const { jobId, jobToken } = askRes.json();
+
+  const stepRes = fakeRes();
+  await stepHandler(fakeReq({ url: '/api/step', body: { jobId, token: jobToken } }), stepRes);
+
+  const out = stepRes.json();
+  assert.equal(out.status, 'done');
+  const stored = jobsDb.state.jobs[0];
+  assert.equal(stored.status, 'done');
+  assert.match(stored.answer, /Overcast/);
+  assert.equal(stored.state, null, 'finished jobs should drop their message history');
+});
+
+await test('a step refuses a token for a different job', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : fakeOpenAIWithTools([FINAL])(url, init);
+
+  const askRes = fakeRes();
+  await askHandler(fakeReq({ headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' } }), askRes);
+
+  const res = fakeRes();
+  await stepHandler(fakeReq({ url: '/api/step',
+    body: { jobId: askRes.json().jobId, token: createJobToken('some-other-job', process.env) } }), res);
+
+  assert.equal(res.statusCode, 401, 'a token is scoped to one job');
+});
+
+await test('a step refuses an unsigned request', async () => {
+  applyEnv(J_ENV);
+  const res = fakeRes();
+  await stepHandler(fakeReq({ url: '/api/step', body: { jobId: 'job-1' } }), res);
+  assert.equal(res.statusCode, 401, 'this endpoint spends money in a loop — it must be locked');
+});
+
+await test('stepping a finished job is a no-op, not an error', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  jobsDb.state.jobs.push({ id: 'job-x', status: 'done', steps: 2, events: [], state: null });
+  globalThis.fetch = jobsDb;
+
+  const res = fakeRes();
+  await stepHandler(fakeReq({ url: '/api/step',
+    body: { jobId: 'job-x', token: createJobToken('job-x', process.env) } }), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().finished, true);
+});
+
+await test('reading a job needs a session or its own token', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  jobsDb.state.jobs.push({ id: 'job-9', status: 'done', question: 'q', answer: 'a', steps: 1, events: [] });
+  globalThis.fetch = jobsDb;
+
+  const denied = fakeRes();
+  await jobsHandler(fakeReq({ method: 'GET', url: '/api/jobs?id=job-9' }), denied);
+  assert.equal(denied.statusCode, 401);
+
+  const allowed = fakeRes();
+  const token = createJobToken('job-9', process.env);
+  await jobsHandler(fakeReq({ method: 'GET',
+    url: `/api/jobs?id=job-9&token=${encodeURIComponent(token)}` }), allowed);
+  assert.equal(allowed.statusCode, 200);
+  assert.equal(allowed.json().job.answer, 'a');
+});
+
+await test('listing every job always needs a real session', async () => {
+  applyEnv(J_ENV);
+  globalThis.fetch = fakeJobsDb();
+  const res = fakeRes();
+  await jobsHandler(fakeReq({ method: 'GET',
+    url: `/api/jobs?token=${encodeURIComponent(createJobToken('job-9', process.env))}` }), res);
+  assert.equal(res.statusCode, 401, 'a single-job token must not unlock the archive');
+});
+
+await test('the job step ceiling is a real number', () => {
+  assert.ok(MAX_JOB_STEPS >= 10 && MAX_JOB_STEPS <= 200);
 });
 
 console.log(`\n${passed} passing${process.exitCode ? ' — WITH FAILURES' : ''}\n`);

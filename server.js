@@ -37,6 +37,8 @@ const routes = {
   '/api/auth': (await import('./api/auth.js')).default,
   '/api/session': (await import('./api/session.js')).default,
   '/api/confirm': (await import('./api/confirm.js')).default,
+  '/api/jobs': (await import('./api/jobs.js')).default,
+  '/api/step': (await import('./api/step.js')).default,
   '/api/history': (await import('./api/history.js')).default,
   '/api/health': (await import('./api/health.js')).default,
 };

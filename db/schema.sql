@@ -229,3 +229,77 @@ revoke all on public.plan_steps from anon, authenticated;
 --   from public.plans p join public.plan_steps s on s.plan_id = p.id
 --   where p.status = 'active' and not s.done
 --   order by p.id, s.step_number;
+
+
+-- ============================================================================
+--  JOBS — asynchronous agent runs
+--
+--  A job is one agent run that outlives a single HTTP request. The Shortcut
+--  creates one and returns immediately; the work continues across as many
+--  serverless invocations as it needs, checkpointing here between steps.
+--
+--  This is what removes the 60-second ceiling. Vercel's waitUntil shares the
+--  function's own timeout, so a single invocation can never run long. But each
+--  NEW invocation gets a fresh budget — so the loop is spread across several,
+--  with `state` carrying everything from one to the next.
+-- ============================================================================
+
+create table if not exists public.jobs (
+  id           uuid        primary key default gen_random_uuid(),
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  finished_at  timestamptz,
+
+  -- queued | running | awaiting_confirm | done | failed | cancelled
+  status       text        not null default 'queued',
+
+  question     text        not null,
+  mode         text,                          -- 'fast' | 'deep', from the router
+  model        text,
+
+  -- The serialised agent state from createAgentState(). Everything needed to
+  -- resume: messages, tool history, budgets spent. See lib/agent.js.
+  state        jsonb,
+
+  -- A readable trace the web app renders live: [{round, tool, ok}, ...]
+  events       jsonb       not null default '[]'::jsonb,
+
+  -- Output
+  title        text,
+  answer       text,
+  detail       text,
+  error        text,
+
+  -- Set when a destructive tool wants a yes/no. The web app shows buttons.
+  pending_confirm jsonb,
+
+  steps        integer     not null default 0,
+  total_tokens integer,
+  source       text,
+  via          text
+);
+
+comment on table public.jobs is
+  'Asynchronous agent runs, checkpointed between serverless invocations.';
+
+create index if not exists jobs_status_idx  on public.jobs (status, created_at desc);
+create index if not exists jobs_created_idx on public.jobs (created_at desc);
+
+alter table public.jobs enable row level security;
+revoke all on public.jobs from anon, authenticated;
+
+-- Housekeeping: `state` holds the full message history, which can be tens of
+-- kilobytes per job. Clearing it on finished jobs keeps the table small while
+-- preserving the answer. Run occasionally, or schedule with pg_cron.
+--
+--   update public.jobs set state = null
+--   where status in ('done','failed') and updated_at < now() - interval '2 days';
+
+-- What is still running:
+--   select id, status, steps, question, updated_at from public.jobs
+--   where status in ('queued','running','awaiting_confirm') order by created_at desc;
+
+-- Fast vs deep, and what each costs:
+--   select mode, count(*), round(avg(total_tokens)) as avg_tokens,
+--          round(avg(extract(epoch from (finished_at - created_at)))) as avg_seconds
+--   from public.jobs where finished_at is not null group by mode;

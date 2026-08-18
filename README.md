@@ -37,6 +37,8 @@ for an answer written to fit on a lock screen.
 | `api/auth.js`       | Login: password → emailed code → session cookie. Also logout.             |
 | `api/session.js`    | "Am I signed in?" — the page asks this on load.                          |
 | `api/confirm.js`    | Phase two of a destructive action: verify the token, then act.             |
+| `api/jobs.js`       | Read background jobs: status, live tool trace, answer.                    |
+| `api/step.js`       | Advances one job per invocation. This is what removes the 60s ceiling.    |
 | `api/history.js`    | Reads back the log. Session login only — not the Shortcut key.            |
 | `api/health.js`     | `GET /api/health` — confirms your env vars landed. Never echoes them.     |
 | `lib/agent.js`      | The agent: prompt, model call, cleanup. No HTTP, so it's testable.        |
@@ -44,6 +46,8 @@ for an answer written to fit on a lock screen.
 | `lib/mailer.js`     | Sends the code. Auto-detects Resend / Postmark / SendGrid.                |
 | `lib/http.js`       | Body parsing, JSON replies, CORS rules.                                   |
 | `lib/confirm.js`    | Signed, short-lived confirmation tokens for deletes.                      |
+| `lib/jobs.js`       | Async runs, checkpointed between serverless invocations.                  |
+| `lib/router.js`     | Decides fast-inline vs deep-background, and which model.                  |
 | `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
 | `lib/tools/location.js` | Where am I / where is X. GPS, IP and geocoding.                       |
 | `lib/tools/weather.js`  | Current conditions and forecast, via Open-Meteo.                      |
@@ -60,7 +64,7 @@ for an answer written to fit on a lock screen.
 | `public/styles.css` | All the styling.                                                          |
 | `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
 | `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
-| `test/smoke.js`     | 183 dependency-free tests, including the security rules. `npm test`.       |
+| `test/smoke.js`     | 217 dependency-free tests, including the security rules. `npm test`.       |
 | `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |

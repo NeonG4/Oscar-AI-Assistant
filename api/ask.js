@@ -26,7 +26,9 @@
  * failures both. See lib/db.js for why logging can never break an answer.
  */
 
-import { askAgent, AgentError } from '../lib/agent.js';
+import { askAgent, createAgentState, AgentError } from '../lib/agent.js';
+import { routeQuestion } from '../lib/router.js';
+import { createJob, createJobToken, continueJob, isJobsConfigured } from '../lib/jobs.js';
 import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
 import { applyCors, readBody, send, HttpError, clientIp } from '../lib/http.js';
 import { logConversation, conversationRow } from '../lib/db.js';
@@ -213,17 +215,56 @@ export default async function handler(req, res) {
     const writeAllowed = canWrite(req, via, body, url);
     const askFirst = requireConfirmation(via, body, process.env);
 
-    const result = await askAgent(
-      {
-        question,
-        timeZone,
-        coords,
-        ip: clientIp(req),
+    // ---- how much machinery does this deserve? ----------------------------
+    // A quick lookup answers inline in a couple of seconds. Real work becomes a
+    // background job so it is not bounded by how long the caller will wait.
+    const route = await routeQuestion(question, { env: process.env, mode: body.mode });
+    const agentInput = {
+      question,
+      timeZone,
+      coords,
+      ip: clientIp(req),
+      canWrite: writeAllowed,
+      requireConfirm: askFirst,
+      model: route.model,
+    };
+
+    if (route.mode === 'deep' && isJobsConfigured() && body.async !== false) {
+      const job = await createJob(
+        {
+          question,
+          mode: route.mode,
+          model: route.model,
+          state: createAgentState(agentInput, process.env),
+          source,
+          via,
+        },
+        { env: process.env }
+      );
+
+      // Fire the first step without waiting — the whole point is to answer now.
+      continueJob(job.id, { env: process.env });
+
+      const answer = 'Working on that now. Open Oscar to watch, or check back shortly.';
+      return send(res, 200, {
+        ok: true,
+        async: true,
+        jobId: job.id,
+        jobToken: createJobToken(job.id, process.env),
+        status: 'queued',
+        mode: route.mode,
+        routedBy: route.via,
+        // Kept so an unchanged Shortcut still shows something sensible.
+        title: 'Working on it',
+        answer,
+        speak: answer,
+        needsConfirmation: false,
+        via,
         canWrite: writeAllowed,
-        requireConfirm: askFirst,
-      },
-      { env: process.env }
-    );
+      });
+    }
+
+    const result = await askAgent(agentInput, { env: process.env });
 
     // Awaited on purpose: on serverless the function can be frozen the instant
     // a response is sent, so a fire-and-forget insert would vanish some of the
@@ -265,6 +306,10 @@ export default async function handler(req, res) {
       model: result.model,
       elapsedMs: result.elapsedMs,
       tools: result.toolsUsed,
+      rounds: result.rounds,
+      async: false,
+      mode: route.mode,
+      routedBy: route.via,
       via,
       canWrite: writeAllowed,
     });

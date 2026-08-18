@@ -127,12 +127,34 @@ breaking the request.
 
 ## Design decisions worth knowing
 
-**The loop is capped at three rounds.** Each round is a full model round trip,
-and your phone is waiting. Three covers the deepest real chain: look it up, act
-on it, answer — "delete the event on Thursday" needs `list_events` then
-`delete_event` before it can say anything. Without a cap, a confused model can
-ping-pong tool calls until the request times out. On the final round tools are
-withheld entirely, so the model has no option but to answer.
+**The agent runs until the work is done, not until a round counter expires.**
+It will happily chain a dozen tool calls — look something up, use that to look
+up the next thing, then act. A raw round cap was the wrong control; what
+actually matters is how long you'll wait and what it costs, so those are the
+budgets:
+
+| Budget | Default | Why |
+| --- | --- | --- |
+| `OSCAR_TOOL_DEADLINE_MS` | 25000 | The real limit on the sync path — an iOS Shortcut gives up long before a dozen rounds |
+| `OSCAR_MAX_TOOL_ROUNDS` | 12 | Backstop against a stuck model, not a design constraint |
+| `OSCAR_MAX_TOOL_CALLS` | 40 | Total tool executions, so cost stays bounded |
+
+When a budget runs out, tools are **withheld** and the model is told why, so it
+answers with what it found rather than stalling. Withholding is what guarantees
+termination: the model cannot call a tool it was never offered.
+
+**Repeated identical calls are refused on the third try.** Two are fine —
+re-reading a plan you just changed is legitimate — but a third gets an error
+telling the model to use the result it already has. That kills the classic
+tool-loop without breaking real work.
+
+**The loop is a stepper, not a `for`.** `runAgentStep()` does exactly one round
+and hands back plain JSON state; `askAgent()` just calls it repeatedly under a
+deadline. That separation is what allows a run to be spread across many
+serverless invocations later — each with its own fresh execution budget — since
+the state can be written to a database in between. There's a test asserting
+state survives a JSON round trip, because that property is what the whole
+design rests on.
 
 **`get_weather` can take a place name, which looks like it duplicates
 `get_location`.** It doesn't — it calls the same geocoder directly. Making the
