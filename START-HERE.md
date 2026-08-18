@@ -8,7 +8,7 @@ sitting; if something breaks you want to know which stage caused it.
 | --- | --- | --- |
 | 1 | A working voice assistant on your phone | ~20 min |
 | 2 | Gmail, Calendar and Tasks | ~25 min |
-| 3 | A searchable log of everything you ask | ~10 min |
+| 3 | A searchable log, plus plans | ~10 min |
 
 Tick these off as you go.
 
@@ -195,6 +195,9 @@ Gives you the History tab, real cost numbers, and the foundation for the
       The `?deep=1` matters — it runs a real query, proving the URL, key *and*
       table all work.
 - [ ] **3.7** Ask something, then open the **History** tab.
+- [ ] **3.8** Try a plan: *"plan my move to Seattle"*, then
+      *"what's next on my move plan?"*, then *"mark step 1 done"*.
+      Plans need the database — that's why they're in this stage.
 
 ---
 

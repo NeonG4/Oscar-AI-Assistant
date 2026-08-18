@@ -138,3 +138,94 @@ revoke all on public.conversations from anon, authenticated;
 --   select unnest(tools_used) as tool, count(*)
 --   from public.conversations where tools_used is not null
 --   group by 1 order by 2 desc;
+
+
+-- ============================================================================
+--  PLANS
+--
+--  Added in the plans release. Safe to run on an existing database — every
+--  statement below is idempotent, which is why you can paste this whole file
+--  again rather than hunting for what changed.
+--
+--  A plan is a goal broken into ordered steps you can tick off individually.
+--  Two tables rather than one JSON blob, because "mark step 2 done" should be
+--  a single UPDATE, not a read-modify-write of the whole plan.
+-- ============================================================================
+
+create table if not exists public.plans (
+  id           bigint generated always as identity primary key,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+
+  title        text        not null,
+  goal         text,                          -- what you actually want to achieve
+  notes        text,
+
+  -- active | done | archived. Kept as text rather than an enum so adding a
+  -- state later doesn't need a migration.
+  status       text        not null default 'active',
+  due          date
+);
+
+comment on table public.plans is 'Goals broken into ordered steps.';
+
+create index if not exists plans_status_idx
+  on public.plans (status, created_at desc);
+
+-- Lets "my move plan" match a plan titled "Moving to Seattle" without an exact
+-- string. pg_trgm is already enabled above for the history search.
+create index if not exists plans_title_trgm_idx
+  on public.plans using gin (title gin_trgm_ops);
+
+
+create table if not exists public.plan_steps (
+  id           bigint generated always as identity primary key,
+  plan_id      bigint      not null references public.plans(id) on delete cascade,
+
+  -- 1-based, and what you say out loud: "mark step 2 done". NOT the row id.
+  -- Deliberately not called "position" — that's a SQL function name, and the
+  -- ambiguity is not worth the elegance.
+  step_number  integer     not null,
+
+  title        text        not null,
+  notes        text,
+  done         boolean     not null default false,
+  done_at      timestamptz
+);
+
+create index if not exists plan_steps_plan_idx
+  on public.plan_steps (plan_id, step_number);
+
+-- Deleting a plan removes its steps (on delete cascade above), so there are no
+-- orphans to clean up.
+
+
+-- ---------------------------------------------------------------------------
+--  Row Level Security — same reasoning as conversations.
+--  RLS on, no policies: the anon key can do nothing, the service role key that
+--  lives only in Vercel keeps full access.
+-- ---------------------------------------------------------------------------
+
+alter table public.plans      enable row level security;
+alter table public.plan_steps enable row level security;
+
+revoke all on public.plans      from anon, authenticated;
+revoke all on public.plan_steps from anon, authenticated;
+
+
+-- ---------------------------------------------------------------------------
+--  Handy plan queries
+-- ---------------------------------------------------------------------------
+
+-- Everything on the go, with progress:
+--   select p.title, p.due,
+--          count(s.*) filter (where s.done) || '/' || count(s.*) as progress
+--   from public.plans p left join public.plan_steps s on s.plan_id = p.id
+--   where p.status = 'active'
+--   group by p.id order by p.due nulls last;
+
+-- The next thing to do on every active plan:
+--   select distinct on (p.id) p.title, s.step_number, s.title
+--   from public.plans p join public.plan_steps s on s.plan_id = p.id
+--   where p.status = 'active' and not s.done
+--   order by p.id, s.step_number;

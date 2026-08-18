@@ -73,6 +73,22 @@ import { deleteEventTool } from '../lib/tools/calendar.js';
 import { deleteTaskTool } from '../lib/tools/tasks.js';
 import { trashEmailTool } from '../lib/tools/gmail.js';
 import { needsConfirmation, getTool } from '../lib/tools/index.js';
+import {
+  createPlan,
+  findPlan,
+  listPlans,
+  setStepDone,
+  addSteps,
+  updatePlan,
+  PlanError,
+} from '../lib/plans.js';
+import {
+  createPlanTool,
+  getPlanTool,
+  completePlanStepTool,
+  deletePlanTool,
+  listPlansTool,
+} from '../lib/tools/plans.js';
 import askHandler from '../api/ask.js';
 import confirmHandler from '../api/confirm.js';
 import historyHandler from '../api/history.js';
@@ -2132,6 +2148,328 @@ await test('skipping confirmation still requires write permission', async () => 
   });
   assert.match(out.error, /write permission/, 'the write gate is independent of confirmation');
   assert.ok(!fetchImpl.calls.some((c) => c.method === 'DELETE'));
+});
+
+
+/* ================================================================== plans */
+section('plans');
+
+/**
+ * Fake Supabase with just enough behaviour to be meaningful: it actually
+ * stores rows, so ordering, numbering and cascade can be asserted rather than
+ * mocked away.
+ */
+function fakePlansDb({ plans = [], steps = [], fail = false } = {}) {
+  const state = { plans: [...plans], steps: [...steps], nextPlanId: 100, nextStepId: 500 };
+  const calls = [];
+
+  const fn = async (url, init = {}) => {
+    const href = String(url);
+    const method = init.method || 'GET';
+    calls.push({ href, method });
+    if (fail) return { ok: false, status: 500, text: async () => 'boom' };
+
+    const path = href.split('/rest/v1/')[1] || '';
+    const [table, query = ''] = path.split('?');
+    const params = new URLSearchParams(query);
+    const body = init.body ? JSON.parse(init.body) : null;
+    const json = (data, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(data) });
+
+    const idFilter = (p) => {
+      const f = params.get('id') || params.get('plan_id');
+      return f ? Number(f.replace('eq.', '')) : null;
+    };
+
+    if (table === 'plans') {
+      if (method === 'POST') {
+        const row = { id: state.nextPlanId++, status: 'active', created_at: 'now', ...body };
+        state.plans.push(row);
+        return json([row], 201);
+      }
+      if (method === 'PATCH') {
+        const id = idFilter();
+        state.plans = state.plans.map((p) => (p.id === id ? { ...p, ...body } : p));
+        return json(null, 204);
+      }
+      if (method === 'DELETE') {
+        const id = idFilter();
+        state.plans = state.plans.filter((p) => p.id !== id);
+        state.steps = state.steps.filter((s) => s.plan_id !== id); // cascade
+        return json(null, 204);
+      }
+      let rows = state.plans;
+      const id = params.get('id');
+      if (id) rows = rows.filter((p) => p.id === Number(id.replace('eq.', '')));
+      const status = params.get('status');
+      if (status) rows = rows.filter((p) => p.status === status.replace('eq.', ''));
+      const title = params.get('title');
+      if (title) {
+        const term = title.replace('ilike.', '').replace(/\*/g, '').toLowerCase();
+        rows = rows.filter((p) => p.title.toLowerCase().includes(term));
+      }
+      return json(rows);
+    }
+
+    if (table === 'plan_steps') {
+      if (method === 'POST') {
+        const rows = (Array.isArray(body) ? body : [body]).map((r) => ({ id: state.nextStepId++, done: false, ...r }));
+        state.steps.push(...rows);
+        return json(rows, 201);
+      }
+      if (method === 'PATCH') {
+        const id = Number((params.get('id') || '').replace('eq.', ''));
+        state.steps = state.steps.map((s) => (s.id === id ? { ...s, ...body } : s));
+        return json(null, 204);
+      }
+      const planId = idFilter();
+      let rows = state.steps.filter((s) => s.plan_id === planId);
+      rows = [...rows].sort((a, b) => a.step_number - b.step_number);
+      return json(rows);
+    }
+
+    throw new Error(`unexpected table: ${table}`);
+  };
+
+  fn.calls = calls;
+  fn.state = state;
+  return fn;
+}
+
+const P_ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
+
+await test('creating a plan numbers its steps from 1', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan(
+    { title: 'Move to Seattle', goal: 'Be moved by October', steps: [{ title: 'Book movers' }, { title: 'Pack kitchen' }, { title: 'Change address' }] },
+    { env: P_ENV, fetchImpl }
+  );
+
+  assert.equal(plan.title, 'Move to Seattle');
+  assert.deepEqual(plan.steps.map((s) => s.step), [1, 2, 3]);
+  assert.equal(plan.nextStep.step, 1);
+  assert.equal(plan.nextStep.title, 'Book movers');
+  assert.equal(plan.progress, '0 of 3 done');
+});
+
+await test('bare strings are accepted as steps', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['Book flight', 'Find hotel'] }, { env: P_ENV, fetchImpl });
+  assert.equal(plan.steps.length, 2);
+  assert.equal(plan.steps[0].title, 'Book flight');
+});
+
+await test('a plan needs a title', async () => {
+  await assert.rejects(
+    () => createPlan({ title: '  ', steps: ['x'] }, { env: P_ENV, fetchImpl: fakePlansDb() }),
+    PlanError
+  );
+});
+
+await test('appended steps continue the numbering', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a', 'b'] }, { env: P_ENV, fetchImpl });
+  await addSteps(plan.id, ['c'], { env: P_ENV, fetchImpl });
+  const after = await findPlan('Trip', { env: P_ENV, fetchImpl });
+  assert.deepEqual(after.steps.map((s) => s.step), [1, 2, 3]);
+  assert.equal(after.steps[2].title, 'c');
+});
+
+await test('completing a step advances nextStep', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a', 'b', 'c'] }, { env: P_ENV, fetchImpl });
+
+  const title = await setStepDone(plan.id, 1, true, { env: P_ENV, fetchImpl });
+  assert.equal(title, 'a');
+
+  const after = await findPlan('Trip', { env: P_ENV, fetchImpl });
+  assert.equal(after.steps[0].done, true);
+  assert.equal(after.nextStep.step, 2, 'next should skip the finished step');
+  assert.equal(after.progress, '1 of 3 done');
+});
+
+await test('a step can be un-ticked', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a', 'b'] }, { env: P_ENV, fetchImpl });
+  await setStepDone(plan.id, 1, true, { env: P_ENV, fetchImpl });
+  await setStepDone(plan.id, 1, false, { env: P_ENV, fetchImpl });
+  const after = await findPlan('Trip', { env: P_ENV, fetchImpl });
+  assert.equal(after.steps[0].done, false);
+});
+
+await test('an out-of-range step number says how many there are', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a', 'b'] }, { env: P_ENV, fetchImpl });
+  await assert.rejects(
+    () => setStepDone(plan.id, 9, true, { env: P_ENV, fetchImpl }),
+    /only has 2 steps/
+  );
+});
+
+await test('plans are found by partial name', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlan({ title: 'Move to Seattle', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  const found = await findPlan('move', { env: P_ENV, fetchImpl });
+  assert.equal(found.title, 'Move to Seattle');
+});
+
+await test('an ambiguous name refuses and names the candidates', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlan({ title: 'Trip to Rome', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  await createPlan({ title: 'Trip to Oslo', steps: ['a'] }, { env: P_ENV, fetchImpl });
+
+  await assert.rejects(
+    () => findPlan('trip', { env: P_ENV, fetchImpl }),
+    (err) => err instanceof PlanError && /Rome/.test(err.message) && /Oslo/.test(err.message)
+  );
+});
+
+await test('an exact title wins over a fuzzy match', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlan({ title: 'Trip', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  await createPlan({ title: 'Trip to Oslo', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  const found = await findPlan('Trip', { env: P_ENV, fetchImpl });
+  assert.equal(found.title, 'Trip');
+});
+
+await test('an unknown plan name is a clear error', async () => {
+  await assert.rejects(
+    () => findPlan('nonsense', { env: P_ENV, fetchImpl: fakePlansDb() }),
+    /could not find a plan/i
+  );
+});
+
+await test('listing defaults to active plans only', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlan({ title: 'Live one', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  const done = await createPlan({ title: 'Finished one', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  await updatePlan(done.id, { status: 'done' }, { env: P_ENV, fetchImpl });
+
+  const active = await listPlans({}, { env: P_ENV, fetchImpl });
+  assert.equal(active.length, 1);
+  assert.equal(active[0].title, 'Live one');
+
+  const all = await listPlans({ status: 'all' }, { env: P_ENV, fetchImpl });
+  assert.equal(all.length, 2);
+});
+
+await test('an invalid status is refused', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a'] }, { env: P_ENV, fetchImpl });
+  await assert.rejects(() => updatePlan(plan.id, { status: 'sideways' }, { env: P_ENV, fetchImpl }), /Status must be/);
+});
+
+await test('deleting a plan removes its steps too', async () => {
+  const fetchImpl = fakePlansDb();
+  const plan = await createPlan({ title: 'Trip', steps: ['a', 'b'] }, { env: P_ENV, fetchImpl });
+  assert.equal(fetchImpl.state.steps.length, 2);
+
+  await runTool('delete_plan', { plan: 'Trip' }, {
+    env: { ...P_ENV, OSCAR_ALLOW_WRITES: '1' }, canWrite: true, confirmed: true, fetchImpl,
+  });
+
+  assert.equal(fetchImpl.state.plans.length, 0);
+  assert.equal(fetchImpl.state.steps.length, 0, 'steps must cascade away with the plan');
+});
+
+await test('a database failure surfaces as a readable error', async () => {
+  await assert.rejects(
+    () => createPlan({ title: 'x', steps: ['a'] }, { env: P_ENV, fetchImpl: fakePlansDb({ fail: true }) }),
+    /Could not save the plan/
+  );
+});
+
+section('plan tools');
+
+await test('create_plan validates the due date format', async () => {
+  await assert.rejects(
+    () => createPlanTool.run({ title: 'x', steps: [{ title: 'a' }], due: 'next month' },
+      { env: P_ENV, fetchImpl: fakePlansDb() }),
+    /must look like/
+  );
+});
+
+await test('create_plan confirms with the first step', async () => {
+  const out = await createPlanTool.run(
+    { title: 'Move', steps: [{ title: 'Book movers' }, { title: 'Pack' }] },
+    { env: P_ENV, fetchImpl: fakePlansDb() }
+  );
+  assert.match(out.confirmation, /Book movers/);
+  assert.match(out.confirmation, /2 steps/);
+});
+
+await test('get_plan answers "what is next"', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlanTool.run({ title: 'Move to Seattle', steps: [{ title: 'Book movers' }, { title: 'Pack' }] },
+    { env: P_ENV, fetchImpl });
+  const out = await getPlanTool.run({ plan: 'move' }, { env: P_ENV, fetchImpl });
+  assert.equal(out.nextStep.title, 'Book movers');
+});
+
+await test('complete_plan_step reports what comes next', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlanTool.run({ title: 'Move', steps: [{ title: 'Book movers' }, { title: 'Pack' }] },
+    { env: P_ENV, fetchImpl });
+
+  const out = await completePlanStepTool.run({ plan: 'Move', step: 1 }, { env: P_ENV, fetchImpl });
+  assert.match(out.confirmation, /Ticked off "Book movers"/);
+  assert.match(out.confirmation, /Next: Pack/);
+});
+
+await test('finishing the last step says so', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlanTool.run({ title: 'Move', steps: [{ title: 'Only thing' }] }, { env: P_ENV, fetchImpl });
+  const out = await completePlanStepTool.run({ plan: 'Move', step: 1 }, { env: P_ENV, fetchImpl });
+  assert.match(out.confirmation, /last one/);
+});
+
+await test('delete_plan names the plan and its step count before deleting', async () => {
+  const fetchImpl = fakePlansDb();
+  await createPlanTool.run({ title: 'Move', steps: [{ title: 'a' }, { title: 'b' }] }, { env: P_ENV, fetchImpl });
+
+  const out = await runTool('delete_plan', { plan: 'Move' }, {
+    env: { ...P_ENV, OSCAR_ALLOW_WRITES: '1' }, canWrite: true, fetchImpl,
+  });
+
+  assert.ok(out.confirmation, 'should ask first');
+  assert.match(out.confirmation.prompt, /"Move"/);
+  assert.match(out.confirmation.prompt, /2 steps/);
+  assert.equal(fetchImpl.state.plans.length, 1, 'nothing may be deleted before confirmation');
+});
+
+await test('empty list_plans says so rather than returning nothing', async () => {
+  const out = await listPlansTool.run({}, { env: P_ENV, fetchImpl: fakePlansDb() });
+  assert.equal(out.count, 0);
+  assert.match(out.note, /No plans saved/);
+});
+
+section('plan tools need the database');
+
+await test('plan tools are withheld when Supabase is not configured', () => {
+  const names = availableTools({ canWrite: true }, { OSCAR_ALLOW_WRITES: '1' }).map((t) => t.name);
+  for (const n of ['create_plan', 'list_plans', 'get_plan', 'delete_plan']) {
+    assert.ok(!names.includes(n), `${n} must be hidden without a database`);
+  }
+  assert.ok(names.includes('get_weather'), 'other tools unaffected');
+});
+
+await test('plan tools appear once Supabase is configured', () => {
+  const env = { ...P_ENV, OSCAR_ALLOW_WRITES: '1' };
+  const readOnly = availableTools({ canWrite: false }, env).map((t) => t.name);
+  const withWrite = availableTools({ canWrite: true }, env).map((t) => t.name);
+
+  assert.ok(readOnly.includes('list_plans') && readOnly.includes('get_plan'),
+    'reading plans needs no write permission');
+  for (const n of ['create_plan', 'add_plan_steps', 'complete_plan_step', 'update_plan', 'delete_plan']) {
+    assert.ok(!readOnly.includes(n), `${n} must need write permission`);
+    assert.ok(withWrite.includes(n));
+  }
+});
+
+await test('creating a plan needs write permission', async () => {
+  const out = await runTool('create_plan', { title: 'x', steps: [{ title: 'a' }] }, {
+    env: { ...P_ENV, OSCAR_ALLOW_WRITES: '1' }, canWrite: false, fetchImpl: fakePlansDb(),
+  });
+  assert.match(out.error, /write permission/);
 });
 
 console.log(`\n${passed} passing${process.exitCode ? ' — WITH FAILURES' : ''}\n`);

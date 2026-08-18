@@ -51,6 +51,8 @@ for an answer written to fit on a lock screen.
 | `lib/tools/tasks.js`    | Google Tasks: read, add, tick off.                                     |
 | `lib/tools/gmail.js`    | Gmail: search, read, draft, send. No delete, by design.                |
 | `lib/google/auth.js`    | OAuth refresh-token exchange and the Google API wrapper.               |
+| `lib/tools/plans.js`    | Plans: goals broken into ordered steps you can tick off.               |
+| `lib/plans.js`          | Plan storage in Supabase. Owned data, not someone else's API.          |
 | `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
 | `scripts/google-auth.js`| One-time authorisation helper. `npm run google-auth`.                  |
 | `db/schema.sql`     | The table, indexes and RLS lockdown. Paste into Supabase's SQL editor.    |
@@ -58,7 +60,7 @@ for an answer written to fit on a lock screen.
 | `public/styles.css` | All the styling.                                                          |
 | `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
 | `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
-| `test/smoke.js`     | 158 dependency-free tests, including the security rules. `npm test`.       |
+| `test/smoke.js`     | 183 dependency-free tests, including the security rules. `npm test`.       |
 | `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |

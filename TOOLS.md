@@ -9,9 +9,10 @@ Oscar can call out for live data and act on your behalf, instead of guessing.
 | `lib/tools/calendar.js` | `list_events`, `create_event`, `delete_event` |
 | `lib/tools/tasks.js` | `list_tasks`, `create_task`, `complete_task`, `delete_task` |
 | `lib/tools/gmail.js` | `search_email`, `read_email`, `draft_email`, `send_email`, `trash_email` |
+| `lib/tools/plans.js` | `create_plan`, `list_plans`, `get_plan`, `add_plan_steps`, `complete_plan_step`, `update_plan`, `delete_plan` |
 
-The Google ones need [GOOGLE.md](./GOOGLE.md) set up first; weather and location
-work out of the box. Anything that changes data is withheld unless the request
+The Google ones need [GOOGLE.md](./GOOGLE.md) set up first, and the plan ones
+need [SUPABASE.md](./SUPABASE.md); weather and location work out of the box. Anything that changes data is withheld unless the request
 proved write authority, and anything destructive asks first when dictated — see
 [Destructive actions](#destructive-actions).
 
@@ -168,6 +169,70 @@ Roughly, on top of a normal answer:
 
 A weather question lands in about 3–5 seconds rather than 2–3. If that bothers
 you, set `OSCAR_DISABLE_REVERSE_GEOCODE=1` to skip the city name.
+
+---
+
+## Plans
+
+A plan is a goal broken into ordered steps you can tick off. Unlike everything
+else, this is data Oscar **owns** rather than reads from someone else's API.
+
+```
+you:    "plan my move to Seattle"
+Oscar:  Saved "Move to Seattle" with 3 steps. First up: Book movers.
+
+you:    "what's next on my move plan?"
+Oscar:  Book movers.
+
+you:    "mark step 1 done"
+Oscar:  Ticked off "Book movers". Next: Pack the kitchen.
+```
+
+### Design decisions
+
+**Oscar writes the steps.** `create_plan` requires them, and the tool
+description tells the model to produce 3–8 concrete actions ordered so earlier
+ones unblock later ones, with no filler. Recording dictation verbatim would put
+the thinking back on you, which is the opposite of the point.
+
+**Plans are addressed by name, never by id.** Nobody says "plan 7". Every tool
+takes a `plan` string and resolves it fuzzily, so "my move plan" finds "Move to
+Seattle". If the name is ambiguous it **refuses and names the candidates**
+rather than guessing — picking the wrong plan and then deleting it is the
+failure mode worth designing against.
+
+**Steps are addressed by number, not row id.** "Mark step 2 done" works with no
+lookup round trip, because `step_number` is what the model passes.
+
+**`nextStep` is surfaced separately** from the steps array, because "what's
+next" is the most likely question and the model shouldn't have to scan a list
+to answer it.
+
+**Two tables, not one JSON blob.** Ticking a step is a single UPDATE rather
+than a read-modify-write of the whole plan.
+
+**Plan tools are withheld without a database** — unlike logging, which no-ops
+silently. Accepting a plan and quietly dropping it would be far worse than
+saying "I can't store plans". `/api/health` reports `plans.available`.
+
+**Reading is free, changing needs write permission.** `list_plans` and
+`get_plan` work from the read-only Shortcut; everything else needs write
+authority. `delete_plan` also asks for confirmation when dictated.
+
+### Tools
+
+| Tool | Write? | What it does |
+| --- | :---: | --- |
+| `list_plans` | | Active plans by default; `status: "all"` for everything |
+| `get_plan` | | One plan in full, with progress and what's next |
+| `create_plan` | ✅ | Title, goal, and the steps Oscar drafts |
+| `add_plan_steps` | ✅ | Append steps, numbered automatically |
+| `complete_plan_step` | ✅ | Tick step N off, or un-tick with `done: false` |
+| `update_plan` | ✅ | Retitle, re-goal, set due date, or set status |
+| `delete_plan` | ✅ | Deletes the plan and its steps — asks first |
+
+Finished a plan? Prefer `update_plan` with `status: "done"` over deleting it.
+There's no permanent-loss path that doesn't ask first.
 
 ---
 

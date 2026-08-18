@@ -64,6 +64,10 @@ export default async function handler(req, res) {
           webDictated: true,
           alsoConfirmsSending: env.OSCAR_CONFIRM_SEND === '1',
         },
+        plans: {
+          // Plans live in Supabase, so they need the database, not Google.
+          available: isConfigured(env),
+        },
         tools: {
           readOnly: availableTools({ canWrite: false }, env).map((t) => t.name),
           withWrite: availableTools({ canWrite: true }, env).map((t) => t.name),

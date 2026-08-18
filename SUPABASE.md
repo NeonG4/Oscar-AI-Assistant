@@ -202,6 +202,29 @@ later.
 
 ---
 
+## Plans
+
+`db/schema.sql` also creates `plans` and `plan_steps`, which back the plan
+tools — goals broken into ordered steps you can tick off by voice. Re-run the
+schema file after pulling any update; every statement is idempotent, which is
+why you paste the whole file rather than hunting for what changed.
+
+Unlike logging, the plan tools are **withheld entirely** when Supabase isn't
+configured, rather than silently no-opping. Accepting a plan and dropping it
+would be worse than admitting it can't be stored. Check `/api/health` →
+`plans.available`.
+
+```sql
+-- Everything on the go, with progress
+select p.title, p.due,
+       count(s.*) filter (where s.done) || '/' || count(s.*) as progress
+from plans p left join plan_steps s on s.plan_id = p.id
+where p.status = 'active'
+group by p.id order by p.due nulls last;
+```
+
+---
+
 ## What this unlocks next
 
 With a log table in place, the "learn about me" feature becomes tractable. The
