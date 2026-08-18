@@ -28,6 +28,8 @@ If you just want the checklist, jump to [The 15-minute path](#the-15-minute-path
   - [`OSCAR_MAIL_FROM`](#oscar_mail_from--optional)
   - [`OSCAR_ALLOWED_ORIGINS`](#oscar_allowed_origins--rarely-needed)
 - [Database variables](#database-variables)
+- [Tool variables](#tool-variables)
+- [Google variables](#google-variables)
 - [Verifying your setup](#verifying-your-setup)
 - [Troubleshooting](#troubleshooting)
 - [Rotating and revoking](#rotating-and-revoking)
@@ -498,6 +500,8 @@ the Shortcut, not your environment variables.
 | Login succeeds then immediately signs you out | `OSCAR_SESSION_SECRET` changed between the two requests, or you're on `http://` over a LAN IP — session cookies are `Secure` |
 | Shortcut says "Not authorised" | `x-oscar-key` doesn't match `OSCAR_SHARED_SECRET` |
 | Everything works locally, nothing in production | Values are in `.env.local` but were never added to Vercel |
+| "That action needs write permission" | `OSCAR_ALLOW_WRITES` isn't `1`, or the `x-oscar-write` header is missing/wrong |
+| Google tools fail with `invalid_grant` | OAuth app still in "Testing" — publish it, then re-run `npm run google-auth` |
 | History tab says no database configured | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` missing, or not redeployed |
 | `/api/health?deep=1` shows `reachable: false` | Table missing (run `db/schema.sql`) or you copied the `anon` key instead of `service_role` |
 
@@ -591,6 +595,72 @@ it a real query runs, proving the URL, the key *and* the table are all good.
 **Default:** `conversations`
 
 Only needed if you renamed the table in `db/schema.sql`.
+
+---
+
+## Tool variables
+
+All optional. The weather and location tools work with none of them set,
+because every service they use is free and keyless. Full detail in
+**[TOOLS.md](./TOOLS.md)**.
+
+### `OSCAR_UNITS` — optional
+
+**Default:** `imperial`
+
+`imperial` gives °F, mph and inches. `metric` gives °C, km/h and mm. Applies to
+everything the weather tool returns.
+
+### `OSCAR_HOME_LOCATION` — optional
+
+A place name like `Seattle, WA`, used only as the last resort — when the
+Shortcut sends no GPS *and* your IP doesn't resolve to anything.
+
+Worth setting even if you add the GPS step, since it's what saves a weather
+question asked from the browser console on a VPN.
+
+### `OSCAR_DISABLE_TOOLS` — optional
+
+Set to `1` to stop offering tools to the model at all. Oscar goes back to
+answering purely from what the model knows. Useful for working out whether a bad
+answer is the tools' fault.
+
+### `OSCAR_DISABLE_REVERSE_GEOCODE` — optional
+
+Set to `1` to skip the coordinates → city name lookup, saving roughly 200–500ms
+per weather question. Answers then say "your location" rather than naming a
+city.
+
+---
+
+## Google variables
+
+For Gmail, Calendar and Tasks. All optional — Oscar works without them. The full
+walkthrough, including the OAuth trap that breaks things after a week, is in
+**[GOOGLE.md](./GOOGLE.md)**.
+
+| Name | What it is |
+| --- | --- |
+| `GOOGLE_CLIENT_ID` | Identifies the app. From Cloud Console → Clients. |
+| `GOOGLE_CLIENT_SECRET` | Ditto. Treat as a secret. |
+| `GOOGLE_REFRESH_TOKEN` | Identifies *your grant*. From `npm run google-auth`. |
+| `OSCAR_ALLOW_WRITES` | `1` to permit anything that changes data. Master switch. |
+| `OSCAR_WRITE_SECRET` | A second random secret, sent as `x-oscar-write`. |
+| `GOOGLE_SEND_ALLOWLIST` | Comma-separated addresses `send_email` may write to. |
+
+### The one that will catch you
+
+A new Google OAuth app defaults to **"Testing"** publishing status, and Google
+issues refresh tokens that **expire after 7 days** in that state. Set publishing
+status to **"In production"** in Google Auth Platform. No verification is needed
+for personal use — you'll just click through an "unverified app" warning once.
+
+### Why there are two secrets
+
+`OSCAR_SHARED_SECRET` lets a request *ask questions*. `OSCAR_WRITE_SECRET` lets
+it *change things*. Keeping them separate means your everyday Shortcut can carry
+only the read key, so that key alone can never send email as you. See the
+security section of [GOOGLE.md](./GOOGLE.md).
 
 ---
 

@@ -585,3 +585,33 @@ code {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
 }
+
+/* ---------- destructive confirmation ---------- */
+
+.confirm {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--bad) 45%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bad) 7%, transparent);
+}
+
+.confirm-note {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.danger {
+  background: var(--bad);
+  color: #fff;
+  border-color: transparent;
+  font-weight: 600;
+}
+
+@media (prefers-color-scheme: light) {
+  .danger {
+    background: #dc2626;
+  }
+}

@@ -35,6 +35,10 @@ create table if not exists public.conversations (
   via          text,                          -- 'key' (Shortcut) or 'session' (browser)
   source       text,                          -- 'shortcut' | 'console' | other
 
+  -- which tools ran, e.g. {get_location,get_weather}. Names only: tool RESULTS
+  -- can contain your coordinates, so they are deliberately not stored.
+  tools_used   text[],
+
   -- performance and cost
   elapsed_ms   integer,                       -- time inside the model call
   total_ms     integer,                       -- time for the whole request
@@ -58,6 +62,11 @@ create extension if not exists pg_trgm;
 
 create index if not exists conversations_question_trgm_idx
   on public.conversations using gin (question gin_trgm_ops);
+
+
+-- Added after the first release. Safe to run on an existing table — this is why
+-- you can paste this whole file again rather than hunting for what changed.
+alter table public.conversations add column if not exists tools_used text[];
 
 
 -- ---------------------------------------------------------------------------
@@ -124,3 +133,8 @@ revoke all on public.conversations from anon, authenticated;
 
 -- Phone vs browser:
 --   select via, count(*) from public.conversations group by via;
+
+-- Which tools actually get used:
+--   select unnest(tools_used) as tool, count(*)
+--   from public.conversations where tools_used is not null
+--   group by 1 order by 2 desc;

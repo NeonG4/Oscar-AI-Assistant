@@ -50,6 +50,10 @@ const el = {
   mic: $('mic'),
   send: $('send'),
   result: $('result'),
+  confirmRow: $('confirm-row'),
+  confirmNote: $('confirm-note'),
+  confirmYes: $('confirm-yes'),
+  confirmNo: $('confirm-no'),
   title: $('r-title'),
   answer: $('r-answer'),
   detail: $('r-detail'),
@@ -312,6 +316,9 @@ async function checkHealth() {
 
 function render({ ok, title, answer, detail, meta }) {
   el.result.hidden = false;
+  // Any new render clears a stale pending confirmation. Leaving an old Yes
+  // button on screen next to a new answer is how people delete the wrong thing.
+  hideConfirm();
   el.result.classList.toggle('error', !ok);
   el.title.textContent = title || 'Oscar';
   el.answer.textContent = answer || '';
@@ -324,6 +331,14 @@ function render({ ok, title, answer, detail, meta }) {
 /* -------------------------------------------------------------------- asking */
 
 let inFlight = false;
+
+/**
+ * Set by the mic handler, cleared on every send.
+ *
+ * The server skips the confirmation step for typed web input but not for
+ * dictation, so it needs to know which this was — and only this page can tell.
+ */
+let cameFromMic = false;
 
 async function ask() {
   const question = el.question.value.trim();
@@ -363,14 +378,70 @@ async function ask() {
         ? `${data.model || 'model'} · ${data.elapsedMs ?? '?'}ms model · ${roundTrip}ms round trip`
         : `HTTP ${res.status} · ${roundTrip}ms`,
     });
+
+    // render() clears any previous confirmation, so this has to come after it.
+    if (data.needsConfirmation) showConfirm(data);
   } catch (err) {
     render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
   } finally {
     inFlight = false;
+    cameFromMic = false;
     el.send.disabled = false;
     el.send.textContent = 'Ask Oscar';
   }
 }
+
+/* ====================================================== confirmations */
+
+/**
+ * A destructive action is waiting on a yes/no. The token from the server
+ * describes exactly what was proposed and is signed, so this page cannot change
+ * what it applies to — it can only relay a yes or a no.
+ */
+let pendingToken = null;
+
+function hideConfirm() {
+  pendingToken = null;
+  el.confirmRow.hidden = true;
+}
+
+function showConfirm(data) {
+  pendingToken = data.confirmToken;
+  el.confirmNote.textContent = `Expires in ${Math.round(
+    (data.confirmExpiresInSeconds || 300) / 60
+  )} minutes. Nothing has happened yet.`;
+  el.confirmRow.hidden = false;
+  el.confirmYes.disabled = false;
+  el.confirmNo.disabled = false;
+  el.confirmYes.focus();
+}
+
+async function resolveConfirm(agreed) {
+  if (!pendingToken) return;
+
+  const token = pendingToken;
+  el.confirmYes.disabled = true;
+  el.confirmNo.disabled = true;
+  el.confirmYes.textContent = agreed ? 'Deleting…' : 'Yes, delete';
+
+  try {
+    const { res, data } = await api('/api/confirm', { token, confirm: agreed });
+    render({
+      ok: Boolean(data.ok),
+      title: data.title || (agreed ? 'Done' : 'Cancelled'),
+      answer: data.answer || '',
+      meta: data.ok ? '' : `HTTP ${res.status}`,
+    });
+    historyLoaded = false;
+  } catch (err) {
+    render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
+  } finally {
+    el.confirmYes.textContent = 'Yes, delete';
+  }
+}
+
+el.confirmYes.addEventListener('click', () => resolveConfirm(true));
+el.confirmNo.addEventListener('click', () => resolveConfirm(false));
 
 /* ============================================================ history tab */
 
@@ -551,7 +622,10 @@ function setupMic() {
 
   recognizer.onend = () => {
     el.mic.classList.remove('on');
-    if (el.question.value.trim()) ask();
+    if (el.question.value.trim()) {
+      cameFromMic = true;
+      ask();
+    }
   };
 
   el.mic.addEventListener('click', () => {
@@ -572,6 +646,12 @@ el.send.addEventListener('click', ask);
 
 el.question.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') ask();
+});
+
+// Editing a dictated draft means you've read it on screen, so it stops counting
+// as dictation. Modifier-only presses don't count as editing.
+el.question.addEventListener('input', () => {
+  cameFromMic = false;
 });
 
 el.copy.addEventListener('click', async () => {

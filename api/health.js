@@ -15,6 +15,8 @@
 
 import { detectProvider } from '../lib/mailer.js';
 import { isConfigured, pingDatabase } from '../lib/db.js';
+import { isGoogleConfigured, canWriteGoogle } from '../lib/google/auth.js';
+import { availableTools } from '../lib/tools/index.js';
 
 export default async function handler(req, res) {
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -49,6 +51,23 @@ export default async function handler(req, res) {
           sharedSecret: Boolean(env.OSCAR_SHARED_SECRET),
         },
         database,
+        google: {
+          connected: isGoogleConfigured(env),
+          writesEnabled: canWriteGoogle(env),
+          writeSecretSet: Boolean(env.OSCAR_WRITE_SECRET),
+          sendAllowlist: env.GOOGLE_SEND_ALLOWLIST ? 'set' : 'anyone',
+        },
+        confirmation: {
+          // Which routes stop and ask before a destructive action.
+          shortcut: true,
+          webTyped: env.OSCAR_CONFIRM_ALWAYS === '1',
+          webDictated: true,
+          alsoConfirmsSending: env.OSCAR_CONFIRM_SEND === '1',
+        },
+        tools: {
+          readOnly: availableTools({ canWrite: false }, env).map((t) => t.name),
+          withWrite: availableTools({ canWrite: true }, env).map((t) => t.name),
+        },
       },
       null,
       2

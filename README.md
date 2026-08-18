@@ -36,22 +36,34 @@ for an answer written to fit on a lock screen.
 | `api/ask.js`        | The endpoint the Shortcut hits. Accepts a session cookie **or** the key.  |
 | `api/auth.js`       | Login: password → emailed code → session cookie. Also logout.             |
 | `api/session.js`    | "Am I signed in?" — the page asks this on load.                          |
+| `api/confirm.js`    | Phase two of a destructive action: verify the token, then act.             |
 | `api/history.js`    | Reads back the log. Session login only — not the Shortcut key.            |
 | `api/health.js`     | `GET /api/health` — confirms your env vars landed. Never echoes them.     |
 | `lib/agent.js`      | The agent: prompt, model call, cleanup. No HTTP, so it's testable.        |
 | `lib/auth.js`       | Signed tokens, code generation, cookies, constant-time comparisons.       |
 | `lib/mailer.js`     | Sends the code. Auto-detects Resend / Postmark / SendGrid.                |
 | `lib/http.js`       | Body parsing, JSON replies, CORS rules.                                   |
+| `lib/confirm.js`    | Signed, short-lived confirmation tokens for deletes.                      |
 | `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
+| `lib/tools/location.js` | Where am I / where is X. GPS, IP and geocoding.                       |
+| `lib/tools/weather.js`  | Current conditions and forecast, via Open-Meteo.                      |
+| `lib/tools/calendar.js` | Google Calendar: read the schedule, add events.                        |
+| `lib/tools/tasks.js`    | Google Tasks: read, add, tick off.                                     |
+| `lib/tools/gmail.js`    | Gmail: search, read, draft, send. No delete, by design.                |
+| `lib/google/auth.js`    | OAuth refresh-token exchange and the Google API wrapper.               |
+| `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
+| `scripts/google-auth.js`| One-time authorisation helper. `npm run google-auth`.                  |
 | `db/schema.sql`     | The table, indexes and RLS lockdown. Paste into Supabase's SQL editor.    |
 | `public/index.html` | Login screen, ask console, and history tab.                                |
 | `public/styles.css` | All the styling.                                                          |
 | `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
 | `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
-| `test/smoke.js`     | 63 dependency-free tests, including the security rules. `npm test`.       |
+| `test/smoke.js`     | 158 dependency-free tests, including the security rules. `npm test`.       |
 | `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
+| `TOOLS.md`          | **How the tools work, and how to add your own.**                          |
+| `GOOGLE.md`         | **Connecting Gmail, Calendar and Tasks.** Includes the 7-day OAuth trap.  |
 
 ## Setup
 
@@ -124,7 +136,21 @@ Debug here, not on the phone.
 
 Follow **[SHORTCUT.md](./SHORTCUT.md)** — four actions, about three minutes.
 
-### 7. Optional: turn on logging
+### 7. Optional: let it check the weather
+
+Nothing to set up — the tools use free, keyless APIs and are on by default. Ask
+"do I need a jacket?" and it will fetch real conditions. Add a **Get Current
+Location** step to your Shortcut so it knows where you are; see
+[TOOLS.md](./TOOLS.md).
+
+### 8. Optional: connect Google
+
+Gmail, Calendar and Tasks — "what's on my calendar?", "any mail from Sam?",
+"add milk to my list". Follow **[GOOGLE.md](./GOOGLE.md)**, and read the warning
+at the top: an OAuth app left in "Testing" status stops working after exactly
+7 days.
+
+### 9. Optional: turn on logging
 
 Follow **[SUPABASE.md](./SUPABASE.md)** — about ten minutes. You get a
 searchable record of every question, real cost and latency numbers, and the

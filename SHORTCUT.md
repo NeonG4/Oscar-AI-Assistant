@@ -47,6 +47,32 @@ action to expand its options.
 > If the variable chip says "Shortcut Input" instead of "Dictated Text", tap it
 > and choose Dictated Text — this is the single most common mistake.
 
+### 2b. Giving Oscar your location
+
+*Optional but strongly recommended if you want weather questions to work.*
+
+Without this, Oscar guesses where you are from your IP address, which on a
+mobile network is often a different city and on a VPN is wherever the exit node
+lives.
+
+Add **Get Current Location** as a new action, and drag it **above** *Get
+Contents of URL*. Then add two more fields to the JSON body in step 2:
+
+- Type `Number`, Key `latitude`, Value: tap the value box → **Current
+  Location** variable → tap it again → choose **Latitude**
+- Type `Number`, Key `longitude`, Value: same, but choose **Longitude**
+
+The first time you run it, iOS asks for location permission. Allow it — the
+coordinates go only to your own Vercel function.
+
+> **What happens to them.** Coordinates are used to fetch weather and are then
+> discarded. They are never written to the database; the log records only which
+> tools ran. See TOOLS.md.
+
+If picking Latitude/Longitude is fiddly, an easier alternative: add one `Text`
+field with key `location` and drop the whole **Current Location** variable in.
+Oscar parses the `"47.6062, -122.3321"` form too.
+
 ### 3. Get Dictionary Value
 
 Search "Get Dictionary Value".
@@ -78,6 +104,91 @@ avoid names that collide with Siri's built-ins.
 - On iPhone 15 Pro and later, assign it to the **Action Button**:
   Settings → Action Button → Shortcut → Ask Oscar.
 - Add it to **Control Center** or the **Lock Screen** for one-tap access.
+
+---
+
+## Handling deletions — the Yes/No prompt
+
+Oscar can delete calendar events, delete tasks, and move mail to the bin. When
+you dictate a destructive request it **does not act immediately**. It replies
+with a question and a signed token, and waits for you to tap Yes.
+
+    you:    "delete the event on Thursday"
+    Oscar:  Delete "Dentist" on Thursday, August 20 at 2:00 PM?   [No] [Yes]
+    you:    tap Yes
+    Oscar:  Deleted "Dentist".
+
+Typed requests in the web console skip this — you typed it deliberately with the
+answer on screen. Dictation is where mishearing happens, so that's where the
+question appears. (The console's own mic button asks too.)
+
+### Adding it to your Shortcut
+
+Everything above stays as it is. Insert these actions **after** *Get Contents of
+URL* and **before** *Show Notification*.
+
+**1. Get Dictionary Value** — key `needsConfirmation`, from *Contents of URL*
+
+**2. If** — *Dictionary Value* **is** `1`
+
+> Shortcuts renders JSON `true` as `1`. If the comparison never matches, switch
+> the condition to **is not** `0`, which behaves the same and is less fussy.
+
+Everything from here to **Otherwise** goes *inside* the If.
+
+**3. Get Dictionary Value** — key `confirmPrompt`, from *Contents of URL*
+
+**4. Choose from Menu** — prompt: the `confirmPrompt` variable from step 3.
+Set exactly two items, in this order:
+
+  - `No`
+  - `Yes, delete`
+
+> This is the yes/no button pair. Put **No** first so the safer option is the one
+> nearest your thumb.
+
+**5. In the `No` branch:** add **Show Notification** with body
+`Cancelled — nothing was changed.` Nothing else. No request is made, so nothing
+can be deleted by accident.
+
+**6. In the `Yes, delete` branch:**
+
+  a. **Get Dictionary Value** — key `confirmToken`, from *Contents of URL*
+
+  b. **Get Contents of URL**
+     - URL: `https://YOUR-APP.vercel.app/api/confirm`
+     - Method: `POST`
+     - Headers: `x-oscar-key` → your `OSCAR_SHARED_SECRET`
+       **and** `x-oscar-write` → your `OSCAR_WRITE_SECRET`
+     - Request Body: `JSON`
+       - Type `Text`, Key `token`, Value: the *Dictionary Value* from 6a
+       - Type `Text`, Key `confirm`, Value: `Yes`
+
+  c. **Get Dictionary Value** — key `answer`, from the *Contents of URL* in 6b
+
+  d. **Show Notification** — body: that *Dictionary Value*
+
+**7. Otherwise** (the plain, no-confirmation path): your original **Get
+Dictionary Value** for `answer` and **Show Notification**, unchanged.
+
+### Why both headers on /api/confirm
+
+The token proves *what* you agreed to. It does not prove *who is asking now*. So
+`/api/confirm` re-checks write authority, and a request carrying only the read
+key is refused even with a perfectly valid token. Without that, a token captured
+from a write-enabled request could be replayed by anything holding the read key.
+
+### The token expires in five minutes
+
+Long enough to read a notification and tap; short enough to be useless if
+someone finds it later. Past that, ask again.
+
+### If you'd rather not build the branching
+
+You don't have to. An un-updated Shortcut still works: `answer` contains the
+confirmation question, so you'll see *"Delete Dentist on Thursday…?"* as a
+notification. Nothing gets deleted — you just have no way to say yes. Deletions
+then only work from the web console.
 
 ---
 
@@ -129,6 +240,11 @@ then send that Text action as `question` instead.
 | `speak`     | `answer` + `detail` merged, for **Speak Text**        |
 | `model`     | which model answered                                  |
 | `elapsedMs` | how long the model took                               |
+| `tools`     | which tools ran, e.g. `["get_weather"]`               |
+| `needsConfirmation` | `true` when a destructive action is waiting on a yes/no |
+| `confirmPrompt`     | the question to show, e.g. `Delete "Dentist" on…?`      |
+| `confirmToken`      | signed token to POST to `/api/confirm`                  |
+| `canWrite`          | whether this request may change anything                |
 
 Failures return the **same shape** with `ok: false` and a human-readable
 `answer`, so a broken key or an out-of-credit account shows up as a readable
@@ -146,6 +262,12 @@ notification rather than a silent no-op.
 | Shortcut errors before any notification  | Usually the JSON body field is empty — recheck step 2             |
 | Nothing happens at all                   | Notifications are off for Shortcuts: Settings → Notifications → Shortcuts |
 | Takes >10s                               | Switch `OPENAI_MODEL` to a smaller/faster model                   |
+| Weather is for the wrong city            | No GPS being sent — add step 2b above                             |
+| "I could not work out where you are"     | No GPS, and your IP didn't resolve. Add step 2b or set `OSCAR_HOME_LOCATION` |
+| Notification asks to confirm but there are no buttons | The confirmation branch isn't built yet — see "Handling deletions" above |
+| "That confirmation has expired"          | More than five minutes passed. Ask again                          |
+| Confirm returns 403                      | The `x-oscar-write` header is missing from the `/api/confirm` request |
+| The If never matches                     | Compare `needsConfirmation` with **is not** `0` instead of **is** `1` |
 
 To debug without the phone, open your deployed URL in a browser — the test
 console there calls the identical endpoint and shows the raw error.

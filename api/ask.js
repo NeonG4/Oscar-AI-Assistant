@@ -28,8 +28,36 @@
 
 import { askAgent, AgentError } from '../lib/agent.js';
 import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
-import { applyCors, readBody, send, HttpError } from '../lib/http.js';
+import { applyCors, readBody, send, HttpError, clientIp } from '../lib/http.js';
 import { logConversation, conversationRow } from '../lib/db.js';
+import { createConfirmToken, CONFIRM_TTL_MS } from '../lib/confirm.js';
+
+/**
+ * Does this request have authority to change things — send mail, create events?
+ *
+ * Two independent conditions, both required:
+ *   - OSCAR_ALLOW_WRITES=1 on the server (your master switch)
+ *   - proof on the request: a full browser login, or the x-oscar-write header
+ *
+ * The header is a SECOND secret, distinct from the Shortcut's read key. That is
+ * the whole point: a read-only Shortcut carries only OSCAR_SHARED_SECRET, so
+ * that key alone can never send email as you.
+ */
+function canWrite(req, via, body, url) {
+  if (process.env.OSCAR_ALLOW_WRITES !== '1') return false;
+
+  // A browser session means password + a code emailed to you. That is a
+  // stronger proof of identity than anything living on the phone.
+  if (via === 'session') return true;
+
+  const expected = (process.env.OSCAR_WRITE_SECRET || '').trim();
+  if (!expected) return false;
+
+  const provided =
+    req.headers['x-oscar-write'] || url.searchParams.get('write') || body.writeKey || '';
+
+  return safeEqual(provided, expected);
+}
 
 /**
  * @returns {'session'|'key'|null} how this request authenticated, if at all.
@@ -49,6 +77,75 @@ function authenticate(req, url, body) {
       : '');
 
   return safeEqual(provided, expected) ? 'key' : null;
+}
+
+/**
+ * Should a destructive action stop and ask first?
+ *
+ * The rule is about HOW the request arrived, because that is the best available
+ * proxy for how the words were produced:
+ *
+ *   Shortcut (x-oscar-key)  → ASK. This is dictation. Speech recognition
+ *                             mishears things, and there is no screen showing
+ *                             you which event actually matched "Thursday".
+ *   Web console, typed      → DON'T ASK. You typed it deliberately, with the
+ *                             answer in front of you, and a Yes button two
+ *                             inches below would just be a second click.
+ *   Web console, dictated   → ASK. The console sets `dictated: true` when the
+ *                             mic was used, so the microphone gets the same
+ *                             protection wherever it is.
+ *
+ * The server cannot actually observe speech versus typing — only the client
+ * knows that — so this trusts the client's own report. That's acceptable
+ * precisely because it can only ever make Oscar MORE cautious than the default
+ * for that route, never less: a forged `dictated: true` adds a confirmation
+ * step, and omitting it on the Shortcut path changes nothing, since the route
+ * itself already forces a confirmation.
+ *
+ * OSCAR_CONFIRM_ALWAYS=1 forces confirmation on every route, including typed
+ * web input, if you'd rather have the belt and braces.
+ */
+function requireConfirmation(via, body, env = process.env) {
+  if (env.OSCAR_CONFIRM_ALWAYS === '1') return true;
+  if (body.dictated === true || body.dictated === 'true' || body.dictated === 1) return true;
+  // 'key' means the Shortcut. A browser session is the typed path.
+  return via === 'key';
+}
+
+/**
+ * Pull coordinates out of the request.
+ *
+ * Shortcuts' "Get Current Location" gives you a Location variable; depending on
+ * how it's wired into the JSON body you end up with flat `latitude`/`longitude`
+ * fields, a nested `location` dictionary, or a "lat,lon" string. Accept all
+ * three rather than making the Shortcut fragile.
+ */
+function readCoords(body = {}, url) {
+  const candidates = [
+    body,
+    body.location,
+    body.coords,
+    { latitude: url.searchParams.get('lat'), longitude: url.searchParams.get('lon') },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const lat = Number(candidate.latitude ?? candidate.lat);
+    const lon = Number(candidate.longitude ?? candidate.lon ?? candidate.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0)) {
+      return { latitude: lat, longitude: lon };
+    }
+  }
+
+  // "47.6062,-122.3321" — what you get if the Location variable is dropped
+  // straight into a text field.
+  const pair = typeof body.location === 'string' ? body.location : body.coords;
+  if (typeof pair === 'string') {
+    const match = /^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/.exec(pair);
+    if (match) return { latitude: Number(match[1]), longitude: Number(match[2]) };
+  }
+
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -108,7 +205,25 @@ export default async function handler(req, res) {
     timeZone = body.tz || body.timeZone || url.searchParams.get('tz') || undefined;
     source = body.source || (via === 'key' ? 'shortcut' : 'console');
 
-    const result = await askAgent({ question, timeZone }, { env: process.env });
+    // GPS from the Shortcut's "Get Current Location" action. Accepts a few
+    // shapes because Shortcuts can hand over a dictionary, and people wire it
+    // up differently.
+    const coords = readCoords(body, url);
+
+    const writeAllowed = canWrite(req, via, body, url);
+    const askFirst = requireConfirmation(via, body, process.env);
+
+    const result = await askAgent(
+      {
+        question,
+        timeZone,
+        coords,
+        ip: clientIp(req),
+        canWrite: writeAllowed,
+        requireConfirm: askFirst,
+      },
+      { env: process.env }
+    );
 
     // Awaited on purpose: on serverless the function can be frozen the instant
     // a response is sent, so a fire-and-forget insert would vanish some of the
@@ -126,18 +241,32 @@ export default async function handler(req, res) {
       })
     );
 
+    // A destructive action is waiting on a yes/no. Hand back a signed token
+    // describing exactly what was proposed.
+    const pending = result.pendingConfirmation
+      ? {
+          needsConfirmation: true,
+          confirmPrompt: result.pendingConfirmation.prompt,
+          confirmToken: createConfirmToken(result.pendingConfirmation, process.env),
+          confirmExpiresInSeconds: Math.floor(CONFIRM_TTL_MS / 1000),
+        }
+      : { needsConfirmation: false };
+
     return send(res, 200, {
       ok: true,
       question: String(question).trim(),
       title: result.title,
       answer: result.answer,
       detail: result.detail,
+      ...pending,
       // `speak` is what you feed into a "Speak Text" action if you want it read
       // aloud: answer + detail merged.
       speak: result.detail ? `${result.answer} ${result.detail}` : result.answer,
       model: result.model,
       elapsedMs: result.elapsedMs,
+      tools: result.toolsUsed,
       via,
+      canWrite: writeAllowed,
     });
   } catch (err) {
     const status = err instanceof AgentError || err instanceof HttpError ? err.status : 500;
