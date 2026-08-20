@@ -230,8 +230,8 @@ yet" rather than "I can't save plans".
 | "That action needs write permission" | Missing `x-oscar-write`, or `OSCAR_ALLOW_WRITES` isn't `1` |
 | Shortcut "Not authorised" | `x-oscar-key` doesn't match `OSCAR_SHARED_SECRET` |
 
-`npm test` needs no keys or network and should print **158 passing**. If it
-does, the code is fine and the problem is configuration.
+`npm test` needs no keys or network and should report **all tests passing**. If
+it does, the code is fine and the problem is configuration.
 
 ---
 

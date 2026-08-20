@@ -733,3 +733,54 @@ code {
   padding: 6px 12px;
   font-size: 13px;
 }
+
+/* ------------------------------------------------------------- questions --
+   Things Oscar has stopped to ask. Given an accent edge because a suspended
+   run is genuinely blocked on you — this is the one card on the page that is
+   waiting rather than reporting. */
+
+.card.questions {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-left-width: 3px;
+}
+
+.card.questions h2 {
+  font-size: 0.95rem;
+  margin: 0;
+  color: var(--accent);
+}
+
+.questions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.question + .question {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.question-text {
+  margin: 0 0 4px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.question-row {
+  margin-top: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* An open question grows to fill the row; option buttons size to their text. */
+.question-row input[type='text'] {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.question[aria-busy='true'] {
+  opacity: 0.55;
+}

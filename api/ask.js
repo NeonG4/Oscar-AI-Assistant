@@ -27,6 +27,7 @@
  */
 
 import { askAgent, createAgentState, AgentError } from '../lib/agent.js';
+import { createMissionState } from '../lib/missions.js';
 import { routeQuestion } from '../lib/router.js';
 import { createJob, createJobToken, continueJob, isJobsConfigured } from '../lib/jobs.js';
 import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
@@ -229,13 +230,21 @@ export default async function handler(req, res) {
       model: route.model,
     };
 
-    if (route.mode === 'deep' && isJobsConfigured() && body.async !== false) {
+    // A mission plans itself and then carries the plan out, which means writing
+    // things. Without write authority it could not even save the plan, so it is
+    // quietly demoted rather than started and failed one step later.
+    const wantsMission = route.mode === 'mission' && writeAllowed;
+    const backgroundMode = wantsMission ? 'mission' : route.mode === 'mission' ? 'deep' : route.mode;
+
+    if (backgroundMode !== 'fast' && isJobsConfigured() && body.async !== false) {
       const job = await createJob(
         {
           question,
-          mode: route.mode,
+          mode: backgroundMode,
           model: route.model,
-          state: createAgentState(agentInput, process.env),
+          state: wantsMission
+            ? createMissionState(agentInput, process.env)
+            : createAgentState(agentInput, process.env),
           source,
           via,
         },
@@ -245,14 +254,17 @@ export default async function handler(req, res) {
       // Fire the first step without waiting — the whole point is to answer now.
       continueJob(job.id, { env: process.env });
 
-      const answer = 'Working on that now. Open Oscar to watch, or check back shortly.';
+      const answer = wantsMission
+        ? "I'll plan that out and work through it. You'll get a notification when it's done."
+        : 'Working on that now. Open Oscar to watch, or check back shortly.';
+
       return send(res, 200, {
         ok: true,
         async: true,
         jobId: job.id,
         jobToken: createJobToken(job.id, process.env),
         status: 'queued',
-        mode: route.mode,
+        mode: backgroundMode,
         routedBy: route.via,
         // Kept so an unchanged Shortcut still shows something sensible.
         title: 'Working on it',

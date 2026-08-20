@@ -11,6 +11,21 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8E%99%3C/text%3E%3C/svg%3E"
     />
+
+    <!--
+      Notifications on iPhone need ALL THREE of these, which is the part of web
+      push nobody tells you. Safari only offers Notification.requestPermission()
+      to a site that has been added to the Home Screen, and it only offers "Add
+      to Home Screen" as an app rather than a bookmark when it finds a manifest
+      with display:standalone. The apple-touch-icon is what it uses on the
+      springboard — without it you get a blurry screenshot of the page.
+    -->
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Oscar" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#0f1115" />
   </head>
 
   <!--
@@ -115,6 +130,17 @@
 
       <!-- ---------------------- ask ---------------------- -->
       <div id="pane-ask">
+        <!--
+          What Oscar is waiting to hear from you. Deliberately the first thing
+          on the page and above the ask box: a run is suspended until one of
+          these is answered, so burying it below the fold would mean work
+          quietly sitting still.
+        -->
+        <section class="card questions" id="questions-card" hidden aria-labelledby="questions-h">
+          <h2 id="questions-h">Oscar is waiting on you</h2>
+          <ul class="questions-list" id="questions-list"></ul>
+        </section>
+
         <section class="card" aria-labelledby="ask-h">
           <h2 id="ask-h" class="sr-only">Ask a question</h2>
 
@@ -172,6 +198,24 @@
             <summary class="meta">Shortcut endpoint</summary>
             <pre class="code" id="recipe"></pre>
             <button id="copy" class="ghost small" type="button">Copy endpoint URL</button>
+          </details>
+
+          <!--
+            Notifications. Hidden entirely until /api/push says it is set up,
+            because a button that can only fail is worse than no button.
+          -->
+          <details class="recipe-details" id="push-details" hidden>
+            <summary class="meta">Notifications</summary>
+            <p class="meta subtle" id="push-status">Checking…</p>
+            <div class="row">
+              <button id="push-enable" class="ghost small" type="button">
+                Turn on notifications
+              </button>
+              <button id="push-test" class="ghost small" type="button" hidden>
+                Send a test
+              </button>
+            </div>
+            <p class="meta subtle" id="push-hint" hidden></p>
           </details>
         </section>
       </div>

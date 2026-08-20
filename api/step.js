@@ -23,8 +23,10 @@
  */
 
 import { runAgentStep, AgentError } from '../lib/agent.js';
+import { runMissionStep, isMissionState, MAX_MISSION_STEPS } from '../lib/missions.js';
 import { getSession } from '../lib/auth.js';
 import { applyCors, readBody, send } from '../lib/http.js';
+import { notifyAll } from '../lib/push.js';
 import {
   loadJob,
   readJobToken,
@@ -32,6 +34,7 @@ import {
   saveProgress,
   markDone,
   markAwaitingConfirm,
+  markAwaitingAnswer,
   markFailed,
   continueJob,
   MAX_JOB_STEPS,
@@ -45,6 +48,37 @@ import {
  */
 const INVOCATION_BUDGET_MS = Number(process.env.OSCAR_STEP_BUDGET_MS) || 40000;
 const CHECKPOINT_HEADROOM_MS = 8000;
+
+/**
+ * Tell the phone the job is over.
+ *
+ * This is the whole reason background jobs are worth having: you ask for
+ * something slow, put the phone away, and hear back when it is done. Awaited
+ * rather than fired and forgotten, because a serverless function stops existing
+ * the moment it responds — an un-awaited push would simply never be sent.
+ *
+ * notifyAll never throws and no-ops when push is unconfigured, so this stays a
+ * single unguarded line at each call site.
+ */
+async function announce(job, { title, body, ttl, requireInteraction }) {
+  const result = await notifyAll(
+    {
+      title,
+      body: String(body || '').slice(0, 300),
+      // Something that needs answering stays on screen until it is touched.
+      requireInteraction: Boolean(requireInteraction),
+      // One tag per job, so a job that finishes while an earlier notice about
+      // it is still on screen replaces it rather than stacking.
+      tag: `oscar-job-${job}`,
+      url: '/',
+      ttl,
+    },
+    {}
+  );
+  if (result && result.failed) {
+    console.error(`[oscar] push for job ${job}: ${result.failed} failed`);
+  }
+}
 
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -69,8 +103,9 @@ export default async function handler(req, res) {
 
     // Terminal, or waiting on a human. Either way there is nothing to do, and
     // saying so plainly stops a caller from retrying in a loop.
-    if (['done', 'failed', 'cancelled', 'awaiting_confirm'].includes(job.status)) {
-      return send(res, 200, { ok: true, status: job.status, finished: job.status !== 'awaiting_confirm' });
+    const parked = ['awaiting_confirm', 'awaiting_answer'];
+    if (['done', 'failed', 'cancelled', ...parked].includes(job.status)) {
+      return send(res, 200, { ok: true, status: job.status, finished: !parked.includes(job.status) });
     }
     if (!job.state) {
       await markFailed(jobId, 'The job has no saved state to resume from.');
@@ -83,25 +118,72 @@ export default async function handler(req, res) {
     let steps = job.steps || 0;
     const deadline = startedAt + INVOCATION_BUDGET_MS;
 
+    // A mission plans and then works its own task list, so it gets a far
+    // higher ceiling than a single conversation would ever need. Both are
+    // still finite: past these numbers the run is stuck, not thorough.
+    const mission = isMissionState(state);
+    const ceiling = mission ? MAX_MISSION_STEPS : MAX_JOB_STEPS;
+
     // Keep going while there is comfortably enough time left to finish a round
     // AND still checkpoint afterwards.
     while (Date.now() < deadline - CHECKPOINT_HEADROOM_MS) {
-      if (steps >= MAX_JOB_STEPS) {
-        await markFailed(jobId, `Gave up after ${MAX_JOB_STEPS} steps without an answer.`);
+      if (steps >= ceiling) {
+        await markFailed(jobId, `Gave up after ${ceiling} steps without an answer.`);
         return send(res, 200, { ok: false, status: 'failed', steps });
       }
 
-      const step = await runAgentStep(state, { env: process.env, deadline });
+      const step = mission
+        ? await runMissionStep(state, { env: process.env, deadline })
+        : await runAgentStep(state, { env: process.env, deadline });
       state = step.state;
       steps += 1;
 
       if (step.status === 'done') {
         await markDone(jobId, step.result);
+        await announce(jobId, {
+          title: step.result.title || 'Oscar',
+          body: step.result.answer,
+        });
         return send(res, 200, { ok: true, status: 'done', steps, answer: step.result.answer });
+      }
+
+      if (step.status === 'question') {
+        // The question row was written by the tool itself; this just records
+        // which one the job is parked on, so the answer can find its way back.
+        const asked = mission
+          ? state.agent && state.agent.pendingQuestion
+          : state.pendingQuestion;
+
+        await markAwaitingAnswer(jobId, {
+          state,
+          result: step.result,
+          questionId: asked && asked.id,
+        });
+
+        // The one notification that must not auto-dismiss: nothing else
+        // happens until this is answered, so a missed one stalls the run
+        // indefinitely.
+        await announce(jobId, {
+          title: 'Oscar has a question',
+          body: step.result.answer,
+          requireInteraction: true,
+          // Held far longer than a status update — a question is still worth
+          // delivering to a phone that has been off all afternoon.
+          ttl: 24 * 60 * 60,
+        });
+
+        return send(res, 200, { ok: true, status: 'awaiting_answer', steps });
       }
 
       if (step.status === 'confirm') {
         await markAwaitingConfirm(jobId, { state, result: step.result });
+        // A job stuck waiting on a yes/no is the case where a notification is
+        // worth most — without one it simply sits there until you next look.
+        await announce(jobId, {
+          title: 'Oscar needs a yes or no',
+          body: step.result.answer,
+          requireInteraction: true,
+        });
         return send(res, 200, { ok: true, status: 'awaiting_confirm', steps });
       }
     }
@@ -126,7 +208,12 @@ export default async function handler(req, res) {
         ? err.message
         : 'Something broke while running the job.';
     console.error('[oscar] step:', err);
-    if (jobId) await markFailed(jobId, message).catch(() => {});
+    if (jobId) {
+      await markFailed(jobId, message).catch(() => {});
+      // A job that died silently is indistinguishable from one still thinking,
+      // which is the worst thing to leave someone holding a phone.
+      await announce(jobId, { title: 'Oscar got stuck', body: message }).catch(() => {});
+    }
     return send(res, 200, { ok: false, status: 'failed', error: message });
   }
 }

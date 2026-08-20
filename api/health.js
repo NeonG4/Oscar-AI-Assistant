@@ -16,7 +16,9 @@
 import { detectProvider } from '../lib/mailer.js';
 import { isConfigured, pingDatabase } from '../lib/db.js';
 import { isGoogleConfigured, canWriteGoogle } from '../lib/google/auth.js';
-import { availableTools } from '../lib/tools/index.js';
+import { availableTools, isRunnerConfigured } from '../lib/tools/index.js';
+import { isPushConfigured, vapidKeys } from '../lib/push.js';
+import { MAX_MISSION_STEPS } from '../lib/missions.js';
 import { routerModels, isRoutingEnabled } from '../lib/router.js';
 import { selfUrl } from '../lib/jobs.js';
 
@@ -94,6 +96,38 @@ export default async function handler(req, res) {
         plans: {
           // Plans live in Supabase, so they need the database, not Google.
           available: isConfigured(env),
+        },
+        questions: {
+          // Oscar pausing to ask you something needs somewhere to keep the
+          // question — a run that suspends with no row to wake it would just
+          // be a run that stopped.
+          available: isConfigured(env),
+        },
+        missions: {
+          // A mission is a job that keeps its task list in a plan, so it needs
+          // both. Writes too — it cannot save a plan it is not allowed to make.
+          available: isConfigured(env) && env.OSCAR_ALLOW_WRITES === '1',
+          maxSteps: MAX_MISSION_STEPS,
+        },
+        notifications: {
+          // Both halves are needed: keys to sign with, and somewhere to keep
+          // the list of devices.
+          configured: isPushConfigured(env),
+          keys: vapidKeys(env) !== null,
+          hint: isPushConfigured(env)
+            ? undefined
+            : 'Run `npm run vapid`, add both keys to Vercel, and redeploy. See PUSH.md.',
+        },
+        runner: {
+          // Whether a machine COULD pair with this deployment — not whether one
+          // is currently running. The queue is deliberately blind to that: a
+          // shut laptop is a normal state, and commands simply wait for it.
+          configured: isRunnerConfigured(env),
+          // Commands are queued in the database like everything else.
+          queue: isConfigured(env),
+          hint: isRunnerConfigured(env)
+            ? undefined
+            : 'Set OSCAR_RUNNER_SECRET and redeploy, then run `npm run runner` on your computer.',
         },
         tools: {
           readOnly: availableTools({ canWrite: false }, env).map((t) => t.name),

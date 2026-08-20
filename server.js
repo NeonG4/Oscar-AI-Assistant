@@ -41,6 +41,9 @@ const routes = {
   '/api/step': (await import('./api/step.js')).default,
   '/api/history': (await import('./api/history.js')).default,
   '/api/health': (await import('./api/health.js')).default,
+  '/api/push': (await import('./api/push.js')).default,
+  '/api/runner': (await import('./api/runner.js')).default,
+  '/api/questions': (await import('./api/questions.js')).default,
 };
 
 const TYPES = {
@@ -48,6 +51,10 @@ const TYPES = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml',
+  // Without these two the manifest is served as a download and the icons as
+  // nothing, which is enough for a browser to refuse to install the app.
+  '.json': 'application/manifest+json; charset=utf-8',
+  '.png': 'image/png',
 };
 
 const server = http.createServer(async (req, res) => {

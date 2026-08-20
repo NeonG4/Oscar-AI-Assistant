@@ -63,6 +63,15 @@ const el = {
   recipe: $('recipe'),
   copy: $('copy'),
   endpoint: $('endpoint'),
+
+  questionsCard: $('questions-card'),
+  questionsList: $('questions-list'),
+
+  pushDetails: $('push-details'),
+  pushStatus: $('push-status'),
+  pushEnable: $('push-enable'),
+  pushTest: $('push-test'),
+  pushHint: $('push-hint'),
 };
 
 const ENDPOINT = new URL('/api/ask', location.origin).toString();
@@ -253,6 +262,14 @@ async function enterConsole(email) {
 
   el.question.focus();
   await checkHealth();
+
+  // Not awaited: notifications are a nicety, and a slow or failing push setup
+  // must never hold up the console being usable.
+  setupPush().catch(() => {});
+
+  // This one IS the greeting the whole feature exists for — a suspended run is
+  // going nowhere until it is answered.
+  loadQuestions().catch(() => {});
 }
 
 function showGate() {
@@ -265,6 +282,12 @@ function showGate() {
   el.historyList.replaceChildren();
   el.result.hidden = true;
   historyLoaded = false;
+
+  // Neither the device list nor Oscar's open questions belong on a signed-out
+  // page — the questions especially, since they describe unfinished work.
+  el.pushDetails.hidden = true;
+  el.questionsCard.hidden = true;
+  el.questionsList.replaceChildren();
 
   el.password.focus();
 }
@@ -534,6 +557,16 @@ async function watchJob(jobId, token) {
         if (job.pendingConfirmation) {
           showConfirm({ confirmToken: null, confirmExpiresInSeconds: 300 });
         }
+        return stopWatching();
+      }
+
+      if (job.status === 'awaiting_answer') {
+        setActivity('working', 'waiting on you');
+        logLine('has a question for you', { kind: 'note' });
+        render({ ok: true, title: job.title || 'A question', answer: job.answer || '' });
+        // The question card at the top of the page is where it gets answered,
+        // so bring it up rather than building a second answer box down here.
+        loadQuestions().catch(() => {});
         return stopWatching();
       }
 
@@ -812,6 +845,319 @@ function setupMic() {
   });
 }
 
+/* ------------------------------------------------------------- questions */
+
+/**
+ * What Oscar has stopped to ask you.
+ *
+ * Everything here is built with createElement rather than innerHTML. The text
+ * originates from a model and passes through a database, so it is exactly the
+ * kind of content that should never be parsed as markup — and the answer box
+ * would be an unusually good place to land a script.
+ */
+
+let answering = false;
+
+function questionNode(question, onAnswered) {
+  const item = document.createElement('li');
+  item.className = 'question';
+
+  const text = document.createElement('p');
+  text.className = 'question-text';
+  text.textContent = question.question;
+  item.append(text);
+
+  if (question.context) {
+    const why = document.createElement('p');
+    why.className = 'meta subtle';
+    why.textContent = question.context;
+    item.append(why);
+  }
+
+  const row = document.createElement('div');
+  row.className = 'row question-row';
+
+  const send = async (value) => {
+    if (answering || !String(value || '').trim()) return;
+    answering = true;
+    item.setAttribute('aria-busy', 'true');
+    for (const control of item.querySelectorAll('button, input')) control.disabled = true;
+
+    try {
+      const { data } = await api('/api/questions', { id: question.id, answer: value });
+      if (data.ok) {
+        // Say what actually happened. "Answered" when a run picked it back up
+        // is different from "answered" when the run had already moved on, and
+        // pretending otherwise would be misleading.
+        const note = document.createElement('p');
+        note.className = 'meta subtle';
+        note.textContent = data.alreadyAnswered
+          ? data.note || 'That one was already answered.'
+          : data.resumed
+            ? 'Answered — Oscar is carrying on.'
+            : `Answered. ${data.reason ? `The run ${data.reason}.` : ''}`.trim();
+        item.replaceChildren(text, note);
+        onAnswered();
+      } else {
+        throw new Error(data.error || 'That did not go through.');
+      }
+    } catch (err) {
+      const oops = document.createElement('p');
+      oops.className = 'meta';
+      oops.textContent = (err && err.message) || 'That did not go through.';
+      item.append(oops);
+      for (const control of item.querySelectorAll('button, input')) control.disabled = false;
+    } finally {
+      answering = false;
+      item.removeAttribute('aria-busy');
+    }
+  };
+
+  if (question.options && question.options.length) {
+    // One tap. This is the difference between a question answered on a bus and
+    // one still sitting there tomorrow.
+    for (const option of question.options) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ghost small';
+      button.textContent = option;
+      button.addEventListener('click', () => send(option));
+      row.append(button);
+    }
+  } else {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Your answer…';
+    input.autocomplete = 'off';
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ghost small';
+    button.textContent = 'Send';
+
+    button.addEventListener('click', () => send(input.value));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') send(input.value);
+    });
+
+    row.append(input, button);
+  }
+
+  item.append(row);
+  return item;
+}
+
+async function loadQuestions() {
+  if (!el.questionsCard) return;
+
+  let data;
+  try {
+    ({ data } = await api('/api/questions'));
+  } catch {
+    return; // signed out, or unreachable. Leave the card hidden.
+  }
+  if (!data || !data.ok || !Array.isArray(data.questions) || !data.questions.length) {
+    el.questionsCard.hidden = true;
+    return;
+  }
+
+  const remaining = new Set(data.questions.map((q) => q.id));
+  const done = (id) => {
+    remaining.delete(id);
+    if (!remaining.size) setTimeout(() => loadQuestions(), 1200);
+  };
+
+  el.questionsList.replaceChildren(
+    ...data.questions.map((q) => questionNode(q, () => done(q.id)))
+  );
+  el.questionsCard.hidden = false;
+}
+
+/* ------------------------------------------------------- notifications */
+
+/**
+ * Turning on push, and the one thing that makes it awkward.
+ *
+ * ON IPHONE THIS ONLY WORKS FROM THE HOME SCREEN. Safari does not expose
+ * Notification.requestPermission() to an ordinary tab — the API is simply
+ * absent — so the button below cannot work until the site has been added to the
+ * Home Screen and opened from there. There is no way to prompt for that and no
+ * event announcing it, so the page detects the situation and says so plainly
+ * rather than offering a button that fails silently.
+ *
+ * Everywhere else (desktop Safari, Chrome, Firefox, Android) it just works.
+ */
+
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+/** iOS reports this on `navigator`; everyone else uses the display-mode query. */
+const isStandalone =
+  window.navigator.standalone === true ||
+  (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+
+let pushReady = false;
+
+/** A base64url VAPID key as the Uint8Array pushManager.subscribe() demands. */
+function decodeKey(base64url) {
+  const padded = base64url.padEnd(base64url.length + ((4 - (base64url.length % 4)) % 4), '=');
+  const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+function pushSay(text, hint) {
+  el.pushStatus.textContent = text;
+  el.pushHint.hidden = !hint;
+  if (hint) el.pushHint.textContent = hint;
+}
+
+async function registerWorker() {
+  // `./sw.js` from the site root, so its scope covers the whole app.
+  return navigator.serviceWorker.register('./sw.js', { scope: './' });
+}
+
+/** Push the current browser's subscription up to the server. */
+async function sendSubscription(subscription) {
+  const json = subscription.toJSON();
+  const { data } = await api('/api/push', {
+    action: 'subscribe',
+    subscription: { endpoint: json.endpoint, keys: json.keys },
+  });
+  if (!data.ok) throw new Error(data.error || 'The server would not store that subscription.');
+  return data;
+}
+
+async function enablePush() {
+  el.pushEnable.disabled = true;
+  try {
+    pushSay('Asking for permission…');
+
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      pushSay(
+        permission === 'denied'
+          ? 'Notifications are blocked for this site.'
+          : 'Permission was dismissed.',
+        permission === 'denied'
+          ? 'Re-allow them in your browser settings for this site, then reload.'
+          : undefined
+      );
+      return;
+    }
+
+    const { data: config } = await api('/api/push');
+    if (!config.ok || !config.publicKey) throw new Error(config.error || 'No key from the server.');
+
+    const registration = await registerWorker();
+    await navigator.serviceWorker.ready;
+
+    // An existing subscription is reused rather than replaced — the endpoint is
+    // stable per browser, so re-subscribing would just re-save the same row.
+    const existing = await registration.pushManager.getSubscription();
+    const subscription =
+      existing ||
+      (await registration.pushManager.subscribe({
+        // Required to be true: a push that shows nothing to the user is not
+        // allowed on any current browser.
+        userVisibleOnly: true,
+        applicationServerKey: decodeKey(config.publicKey),
+      }));
+
+    await sendSubscription(subscription);
+
+    pushReady = true;
+    pushSay('Notifications are on for this device.');
+    el.pushEnable.hidden = true;
+    el.pushTest.hidden = false;
+  } catch (err) {
+    pushSay('Could not turn notifications on.', (err && err.message) || String(err));
+  } finally {
+    el.pushEnable.disabled = false;
+  }
+}
+
+async function testPush() {
+  el.pushTest.disabled = true;
+  const previous = el.pushTest.textContent;
+  el.pushTest.textContent = 'Sending…';
+  try {
+    const { data } = await api('/api/push', { action: 'test' });
+    pushSay(
+      data.ok ? `Sent to ${data.sent} device${data.sent === 1 ? '' : 's'}.` : 'Nothing was sent.',
+      data.ok ? undefined : (data.errors && data.errors[0]) || data.error
+    );
+  } catch (err) {
+    pushSay('The test failed.', (err && err.message) || String(err));
+  } finally {
+    el.pushTest.textContent = previous;
+    el.pushTest.disabled = false;
+  }
+}
+
+async function setupPush() {
+  if (!el.pushDetails) return;
+
+  let config;
+  try {
+    ({ data: config } = await api('/api/push'));
+  } catch {
+    return; // signed out, or the endpoint isn't there. Stay hidden.
+  }
+  if (!config || !config.ok || !config.configured) return;
+
+  el.pushDetails.hidden = false;
+
+  // The iPhone case, checked before feature detection so the advice is specific
+  // rather than a generic "your browser doesn't support this".
+  if (isIOS && !isStandalone) {
+    el.pushEnable.hidden = true;
+    pushSay(
+      'Add Oscar to your Home Screen first.',
+      'Share → Add to Home Screen, then open Oscar from there and come back. ' +
+        'iPhone only allows notifications for apps added this way.'
+    );
+    return;
+  }
+
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    el.pushEnable.hidden = true;
+    pushSay('This browser cannot do notifications.');
+    return;
+  }
+
+  // Already granted and already subscribed? Then say so instead of offering a
+  // button that would do nothing.
+  try {
+    const registration = await registerWorker();
+    const existing = await registration.pushManager.getSubscription();
+    if (Notification.permission === 'granted' && existing) {
+      // Re-save on every load. Cheap, and it repairs the case where the server
+      // forgot the device (a wiped database) while the browser still has it.
+      await sendSubscription(existing).catch(() => {});
+      pushReady = true;
+      el.pushEnable.hidden = true;
+      el.pushTest.hidden = false;
+      pushSay('Notifications are on for this device.');
+      return;
+    }
+  } catch {
+    /* fall through to the button */
+  }
+
+  pushSay(
+    config.devices && config.devices.length
+      ? `On for ${config.devices.length} other device${config.devices.length === 1 ? '' : 's'}, not this one.`
+      : 'Get answers as notifications, even with Oscar closed.'
+  );
+}
+
+// The worker asks for this when a push service expires a subscription behind
+// our back. Re-subscribing needs the public key, which only the page has.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'resubscribe' && pushReady) setupPush();
+  });
+}
+
 /* ------------------------------------------------------------------- wiring */
 
 el.send.addEventListener('click', ask);
@@ -835,6 +1181,9 @@ el.copy.addEventListener('click', async () => {
     el.copy.textContent = 'Copy failed — select it below';
   }
 });
+
+el.pushEnable.addEventListener('click', enablePush);
+el.pushTest.addEventListener('click', testPush);
 
 setupMic();
 init();

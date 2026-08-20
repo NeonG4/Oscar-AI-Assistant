@@ -47,7 +47,11 @@ for an answer written to fit on a lock screen.
 | `lib/http.js`       | Body parsing, JSON replies, CORS rules.                                   |
 | `lib/confirm.js`    | Signed, short-lived confirmation tokens for deletes.                      |
 | `lib/jobs.js`       | Async runs, checkpointed between serverless invocations.                  |
-| `lib/router.js`     | Decides fast-inline vs deep-background, and which model.                  |
+| `lib/router.js`     | Decides fast-inline vs deep-background vs mission, and which model.       |
+| `lib/missions.js`   | Work that plans itself then does itself. The plan is the memory.          |
+| `lib/questions.js`  | Things Oscar has stopped to ask you, and your answers.                   |
+| `lib/tools/questions.js` | `ask_user`: suspends the run until you reply.                        |
+| `api/questions.js`  | Read what's waiting, answer it, and wake the run back up.                |
 | `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
 | `lib/tools/location.js` | Where am I / where is X. GPS, IP and geocoding.                       |
 | `lib/tools/weather.js`  | Current conditions and forecast, via Open-Meteo.                      |
@@ -58,18 +62,32 @@ for an answer written to fit on a lock screen.
 | `lib/tools/plans.js`    | Plans: goals broken into ordered steps you can tick off.               |
 | `lib/plans.js`          | Plan storage in Supabase. Owned data, not someone else's API.          |
 | `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
+| `lib/tools/shell.js`    | `run_cmd` / `check_cmd`: commands queued for your own computer.        |
+| `lib/commands.js`       | The command queue. Your laptop polls it; nothing ever calls in.        |
+| `lib/shell-policy.js`   | What the runner will and will not execute. The security boundary.      |
+| `api/runner.js`         | The one endpoint your laptop talks to. Its own secret, deliberately.   |
+| `scripts/runner.js`     | The runner you start on your machine. `npm run runner`.                |
+| `lib/push.js`           | Web push: VAPID, payload encryption, and the device list.              |
+| `api/push.js`           | Subscribe, unsubscribe, send a test. Session login only.               |
+| `public/sw.js`          | The service worker. Shows notifications when the page is closed.       |
+| `public/manifest.json`  | Makes Oscar installable — required for notifications on iOS.           |
+| `scripts/vapid-keys.js` | Generates the notification keypair. `npm run vapid`.                   |
 | `scripts/google-auth.js`| One-time authorisation helper. `npm run google-auth`.                  |
 | `db/schema.sql`     | The table, indexes and RLS lockdown. Paste into Supabase's SQL editor.    |
 | `public/index.html` | Login screen, ask console, and history tab.                                |
 | `public/styles.css` | All the styling.                                                          |
 | `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
 | `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
-| `test/smoke.js`     | 217 dependency-free tests, including the security rules. `npm test`.       |
+| `test/smoke.js`     | 313 dependency-free tests, including the security rules. `npm test`.       |
 | `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
 | `TOOLS.md`          | **How the tools work, and how to add your own.**                          |
 | `GOOGLE.md`         | **Connecting Gmail, Calendar, Tasks, Drive and Docs.** Includes the 7-day OAuth trap. |
+| `RUNNER.md`         | **Letting Oscar run commands on your own computer.** Read before enabling it. |
+| `PUSH.md`           | **Notifications on your phone.** Includes the iOS Home Screen trap.        |
+| `MISSIONS.md`       | **Work that plans itself, then does itself.** Goal in, program out.        |
+| `QUESTIONS.md`      | **When Oscar doesn't know.** Pausing to ask, and resuming on your answer.  |
 
 ## Setup
 

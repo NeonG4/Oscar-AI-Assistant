@@ -303,3 +303,188 @@ revoke all on public.jobs from anon, authenticated;
 --   select mode, count(*), round(avg(total_tokens)) as avg_tokens,
 --          round(avg(extract(epoch from (finished_at - created_at)))) as avg_seconds
 --   from public.jobs where finished_at is not null group by mode;
+
+
+-- ============================================================================
+--  COMMANDS — the bridge to your own computer
+--
+--  Oscar runs on Vercel. Your laptop sits behind NAT with no inbound port, so
+--  the server can never reach INTO it. The direction is therefore inverted:
+--  this table is a mailbox, and a small local runner (scripts/runner.js) polls
+--  it outward, claims work, and posts the result back.
+--
+--  Same baton pattern as `jobs` — nothing has to stay connected, and the laptop
+--  can be shut, asleep or offline without anything breaking. Commands simply
+--  wait, and expire if nobody ever collects them.
+--
+--  SECURITY NOTE. A row here is a request, never an authorisation. The runner
+--  on the laptop applies its own allowlist and refuses anything it dislikes,
+--  regardless of what this table says. That is deliberate: if the deployment or
+--  this database were ever compromised, the laptop still says no.
+-- ============================================================================
+
+create table if not exists public.commands (
+  id           uuid        primary key default gen_random_uuid(),
+  created_at   timestamptz not null default now(),
+  claimed_at   timestamptz,
+  finished_at  timestamptz,
+
+  -- queued | claimed | done | failed | refused | expired
+  status       text        not null default 'queued',
+
+  -- what was asked for
+  command      text        not null,
+  cwd          text,                          -- null means the runner's default
+  timeout_ms   integer     not null default 30000,
+  reason       text,                          -- why the agent wanted to run it
+
+  -- what came back
+  exit_code    integer,
+  stdout       text,
+  stderr       text,
+  error        text,                          -- transport/refusal message
+
+  -- provenance
+  runner       text,                          -- hostname that claimed it
+  job_id       uuid,                          -- set when a background job asked
+  via          text                           -- 'session' | 'write-key'
+);
+
+comment on table public.commands is
+  'Shell commands queued for the local runner on your own machine.';
+
+-- The runner's only read pattern: oldest queued first.
+create index if not exists commands_queued_idx
+  on public.commands (status, created_at);
+
+create index if not exists commands_created_idx
+  on public.commands (created_at desc);
+
+alter table public.commands enable row level security;
+revoke all on public.commands from anon, authenticated;
+
+-- Anything nobody collected within ten minutes is stale — the laptop was off.
+-- Run occasionally, or schedule with pg_cron:
+--
+--   update public.commands set status = 'expired', finished_at = now()
+--   where status = 'queued' and created_at < now() - interval '10 minutes';
+
+-- What has run lately:
+--   select created_at, status, exit_code, command from public.commands
+--   order by created_at desc limit 50;
+
+
+-- ============================================================================
+--  PUSH SUBSCRIPTIONS — notifications to the phone
+--
+--  One row per browser that has agreed to receive notifications. The endpoint
+--  is issued by the browser's own push service (Apple, Google, Mozilla), and
+--  the two keys are what let the server encrypt a payload that ONLY that
+--  browser can read — the push service relays it without being able to see it.
+--
+--  The endpoint doubles as the identity: re-subscribing the same browser
+--  returns the same endpoint, so it is the natural unique key.
+--
+--  These rows are credentials for talking TO your devices, not for reading
+--  anything, but they are still worth the same RLS lockdown as everything else.
+-- ============================================================================
+
+create table if not exists public.push_subscriptions (
+  id           bigint generated always as identity primary key,
+  created_at   timestamptz not null default now(),
+  last_used_at timestamptz,
+
+  endpoint     text        not null unique,
+  p256dh       text        not null,         -- the browser's public key
+  auth         text        not null,         -- the shared auth secret
+
+  label        text,                         -- "iPhone", from the user agent
+  -- Push services return 404/410 for a subscription that is gone for good.
+  -- Rather than delete immediately we mark it, so a flaky day doesn't silently
+  -- unsubscribe every device you own.
+  failures     integer     not null default 0,
+  expired_at   timestamptz
+);
+
+comment on table public.push_subscriptions is
+  'Browsers that have agreed to receive notifications from Oscar.';
+
+create index if not exists push_subscriptions_live_idx
+  on public.push_subscriptions (expired_at, created_at desc);
+
+alter table public.push_subscriptions enable row level security;
+revoke all on public.push_subscriptions from anon, authenticated;
+
+-- Which devices are live:
+--   select label, created_at, last_used_at, failures from public.push_subscriptions
+--   where expired_at is null order by created_at desc;
+
+-- Forget the dead ones:
+--   delete from public.push_subscriptions where expired_at is not null;
+
+
+-- ============================================================================
+--  QUESTIONS — Oscar asking YOU something
+--
+--  The inverse of everything else here. When a run hits something it cannot
+--  decide — which framework, which of two files you meant, whether a guess is
+--  right — it writes a row here, notifies you, and goes to sleep. Answering it
+--  wakes the run up exactly where it stopped.
+--
+--  WHY THIS IS A TABLE AND NOT JUST A FIELD ON `jobs`
+--
+--  Because the question outlives the attempt to answer it. You get the
+--  notification on a bus, answer it three hours later from a laptop, and the
+--  job resumes. It also means the website can greet you with everything Oscar
+--  is currently wondering about, across every run, in one list.
+-- ============================================================================
+
+create table if not exists public.questions (
+  id           uuid        primary key default gen_random_uuid(),
+  created_at   timestamptz not null default now(),
+  answered_at  timestamptz,
+
+  -- pending | answered | cancelled | expired
+  status       text        not null default 'pending',
+
+  question     text        not null,
+  -- Optional multiple choice. The web app renders these as buttons, which is
+  -- the difference between answering on a phone and not bothering.
+  options      jsonb,
+  -- Why it is asking, shown underneath. Usually one line.
+  context      text,
+
+  answer       text,
+
+  -- The run waiting on this. Null for a question asked outside a job.
+  job_id       uuid
+);
+
+comment on table public.questions is
+  'Things Oscar has stopped to ask you, and your answers.';
+
+create index if not exists questions_pending_idx
+  on public.questions (status, created_at desc);
+
+create index if not exists questions_job_idx
+  on public.questions (job_id);
+
+alter table public.questions enable row level security;
+revoke all on public.questions from anon, authenticated;
+
+-- What is Oscar waiting on right now:
+--   select created_at, question, job_id from public.questions
+--   where status = 'pending' order by created_at desc;
+
+-- Anything unanswered for a week is not going to be answered:
+--   update public.questions set status = 'expired'
+--   where status = 'pending' and created_at < now() - interval '7 days';
+
+-- Jobs gained a pointer to the question they are waiting on. Safe to re-run;
+-- this is why you can paste this whole file again rather than diffing it.
+alter table public.jobs add column if not exists question_id uuid;
+
+-- What is parked waiting on you, with the question itself:
+--   select j.id, q.question, q.created_at
+--   from public.jobs j join public.questions q on q.id = j.question_id
+--   where j.status = 'awaiting_answer';
