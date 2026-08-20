@@ -736,7 +736,7 @@ function renderTasks(tasks) {
 
   el.taskProgress.textContent = current
     ? `Task ${current.n} of ${list.length} · ${done} done`
-    : `All ${list.length} tasks done`;
+    : `All ${list.length} task${list.length === 1 ? '' : 's'} done`;
 
   el.taskList.replaceChildren(
     ...list.map((task) => {
@@ -1095,7 +1095,7 @@ function jobNode(job) {
     progress.className = 'tasks-head';
     progress.textContent = current
       ? `Task ${current.n} of ${tasks.length} · ${done} done`
-      : `All ${tasks.length} tasks done`;
+      : `All ${tasks.length} task${tasks.length === 1 ? '' : 's'} done`;
 
     const list = document.createElement('ol');
     list.className = 'tasks-list';
@@ -1124,16 +1124,19 @@ function jobNode(job) {
     ])
   );
 
-  // A finished job's answer is a turn in a conversation, so the useful action
-  // is to open that conversation rather than to re-read it here.
-  if (job.conversationId) {
-    const open = document.createElement('button');
-    open.type = 'button';
-    open.className = 'ghost small';
-    open.textContent = 'Open conversation';
-    open.addEventListener('click', () => openThread(job.conversationId));
-    node.append(open);
-  }
+  // Offered for every job, not just the ones with a conversation: opening a job
+  // is how you get its live task list and event trace into the thinking panel,
+  // and that is worth having whether or not there is a thread behind it.
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'ghost small';
+  open.textContent = ACTIVE_STATUSES.has(job.status)
+    ? 'Watch it work'
+    : job.conversationId
+      ? 'Open conversation'
+      : 'Open this job';
+  open.addEventListener('click', () => openJob(job));
+  node.append(open);
 
   return node;
 }
@@ -1304,22 +1307,19 @@ function threadNode(thread) {
   return node;
 }
 
-/**
- * Reopen a thread in the Ask pane and carry on with it.
- *
- * The turns are re-fetched rather than reused from the history card, because
- * the card only holds what the list query returned — and a thread is read back
- * oldest-first, which is the order it needs to be shown in.
- */
-async function openThread(id) {
-  showTab('ask');
-  stopWatching();
-  clearLog();
-  renderTasks([]);
-  setActivity('idle', 'idle');
-  hideConfirm();
+/** The standing invitation, restored whenever the thread is emptied. */
+const THREAD_INVITATION = 'Ask Oscar anything. Follow-ups carry on from the answer before them.';
 
-  conversationId = id;
+/**
+ * Replace the thread with the stored turns of one conversation.
+ *
+ * The turns are re-fetched rather than reused from whatever card was clicked,
+ * because a card only holds what the list query returned — and a thread is read
+ * back oldest-first, which is the order it needs to be shown in.
+ *
+ * @returns {Promise<number>} how many turns were rendered.
+ */
+async function renderThread(id) {
   el.thread.replaceChildren();
   el.threadEmpty.hidden = false;
   el.threadEmpty.textContent = 'Loading this conversation…';
@@ -1327,11 +1327,6 @@ async function openThread(id) {
   try {
     const { data } = await api(`/api/history?conversation=${encodeURIComponent(id)}&limit=50`);
     const rows = (data && data.rows) || [];
-
-    if (!rows.length) {
-      el.threadEmpty.textContent = 'That conversation has no turns left to show.';
-      return;
-    }
 
     for (const row of rows) {
       addTurn('you', { text: row.question || '' });
@@ -1348,13 +1343,115 @@ async function openThread(id) {
       });
     }
 
-    el.question.focus();
+    return rows.length;
   } catch (err) {
     el.threadEmpty.textContent = String((err && err.message) || err);
+    return 0;
   } finally {
-    // Restore the standing invitation for whenever the thread is cleared next.
     if (el.thread.childElementCount) el.threadEmpty.hidden = true;
-    else el.threadEmpty.textContent = 'Ask Oscar anything. Follow-ups carry on from the answer before them.';
+  }
+}
+
+/** Reopen a conversation from History and carry on with it. */
+async function openThread(id) {
+  showTab('ask');
+  stopWatching();
+  clearLog();
+  renderTasks([]);
+  setActivity('idle', 'idle');
+  hideConfirm();
+
+  conversationId = id;
+
+  const shown = await renderThread(id);
+  if (!shown) el.threadEmpty.textContent = THREAD_INVITATION;
+  el.question.focus();
+}
+
+/**
+ * Open a job in the Ask pane, with its progress attached.
+ *
+ * The conversation alone is not the useful thing here, which is the whole
+ * reason this is separate from openThread: a job you are opening from the Jobs
+ * tab is usually one you want to WATCH, and its answer does not exist yet. So
+ * the task list, the event trace and the live poll come with it.
+ *
+ * Two cases, and the difference is where the turns come from:
+ *
+ *   still going — nothing has been logged yet, because a conversation row is
+ *                 written when the job finishes. The question is appended here
+ *                 with an empty reply underneath, and watchJob fills that reply
+ *                 in when the answer lands.
+ *   finished    — the answer is already a turn in the thread, so the thread is
+ *                 enough. Only jobs with no conversation (an older row, or one
+ *                 started before threads existed) get theirs rebuilt from the
+ *                 job itself.
+ */
+async function openJob(job) {
+  showTab('ask');
+  stopWatching();
+  clearLog();
+  hideConfirm();
+
+  const active = ACTIVE_STATUSES.has(job.status);
+
+  // Painted from the list row first, so the panel is populated before the
+  // fetch below rather than sitting empty while it happens.
+  renderTasks(job.tasks || []);
+  setActivity(
+    active ? 'working' : job.status === 'done' ? 'done' : 'bad',
+    active ? `${job.status} · ${job.steps || 0} steps` : STATUS_LABEL[job.status] || job.status
+  );
+
+  conversationId = job.conversationId || null;
+
+  if (job.conversationId) {
+    await renderThread(job.conversationId);
+  } else {
+    el.thread.replaceChildren();
+    el.threadEmpty.hidden = false;
+    el.threadEmpty.textContent = THREAD_INVITATION;
+  }
+
+  if (active) {
+    addTurn('you', { text: job.question || '' });
+    const reply = addTurn('oscar', { pending: true });
+    reply.node.classList.add('working');
+    // No token: this is a signed-in browser, which /api/jobs accepts on its own.
+    watchJob(job.id, null, reply);
+    return;
+  }
+
+  // Finished. One fetch for the event trace, which the list query does not
+  // carry — everything else is already on the row we were handed.
+  try {
+    const { data } = await api(`/api/jobs?id=${encodeURIComponent(job.id)}`);
+    const full = (data && data.job) || job;
+
+    renderTasks(full.tasks || []);
+    renderEvents(full.events || [], 0);
+    logLine(full.status === 'failed' ? full.error || 'failed' : 'finished', {
+      kind: full.status === 'failed' ? 'bad' : 'note',
+      how: `${full.steps || 0} steps`,
+    });
+
+    if (!job.conversationId) {
+      addTurn('you', { text: full.question || '' });
+      const reply = addTurn('oscar', {});
+      fillTurn(reply, {
+        ok: full.status !== 'failed',
+        text: full.status === 'failed' ? full.error || 'The job failed.' : full.answer || '',
+        detail: full.detail,
+        meta: [
+          { text: formatWhen(full.createdAt || job.createdAt) },
+          { text: full.model || '', kind: 'model' },
+          { text: `${full.steps || 0} steps` },
+        ],
+      });
+    }
+  } catch {
+    // The list row was enough to show the tasks and the status; a missing event
+    // trace is not worth an error message over.
   }
 }
 
