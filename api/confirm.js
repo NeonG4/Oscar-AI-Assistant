@@ -130,9 +130,18 @@ export default async function handler(req, res) {
     const answer =
       (outcome.result && outcome.result.confirmation) || 'Done.';
 
+    // The thread this yes/no belongs to, when the caller knows it. Shape-checked
+    // rather than trusted verbatim, since it ends up in a database column — and
+    // a confirmation logged into no thread would show up in History as an
+    // orphan entry next to the conversation it actually came from.
+    const conversationId = /^[0-9a-fA-F-]{16,40}$/.test(String(body.conversationId || ''))
+      ? String(body.conversationId)
+      : null;
+
     await logConversation(
       conversationRow({
         question: `[confirmed] ${pending.prompt}`,
+        conversationId,
         result: {
           title: 'Done',
           answer,

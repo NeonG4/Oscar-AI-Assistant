@@ -45,6 +45,12 @@ see a `conversations` table with no rows yet.
 The script is safe to run more than once, so if you're unsure whether it worked,
 just run it again.
 
+> **Already had Supabase set up before conversations and task lists existed?**
+> Paste `db/schema.sql` in and run it again. It adds `conversations.conversation_id`
+> (which is what groups a back-and-forth into one thread) and `jobs.tasks` plus
+> `jobs.conversation_id`. Until you do, background jobs will fail to start —
+> the insert names a column the table does not have yet.
+
 ### What that script did
 
 - Created `conversations` with columns for the question, answer, model, timing,
@@ -199,6 +205,8 @@ later.
 | Answers work but nothing is logged | Check Vercel → Logs for `could not log to supabase` |
 | Everything times out after a break | Free project auto-paused. Unpause in the dashboard |
 | Rows appear but `total_tokens` is null | Some model responses omit usage data; harmless |
+| "Could not queue the job" mentioning a column | Schema is out of date — run `db/schema.sql` again |
+| Follow-up questions ignore what was just said | Same: no `conversation_id` column to read the thread back from |
 
 ---
 

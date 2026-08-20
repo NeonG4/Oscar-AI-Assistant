@@ -12,6 +12,7 @@ Oscar can call out for live data and act on your behalf, instead of guessing.
 | `lib/tools/drive.js` | `search_drive`, `read_drive_file`, `trash_drive_file` |
 | `lib/tools/docs.js` | `create_doc`, `read_doc`, `append_to_doc` |
 | `lib/tools/plans.js` | `create_plan`, `list_plans`, `get_plan`, `add_plan_steps`, `complete_plan_step`, `update_plan`, `delete_plan` |
+| `lib/tools/checklist.js` | `plan_tasks`, `finish_task` |
 
 The Google ones need [GOOGLE.md](./GOOGLE.md) set up first, and the plan ones
 need [SUPABASE.md](./SUPABASE.md); weather and location work out of the box. Anything that changes data is withheld unless the request
@@ -261,6 +262,59 @@ authority. `delete_plan` also asks for confirmation when dictated.
 
 Finished a plan? Prefer `update_plan` with `status: "done"` over deleting it.
 There's no permanent-loss path that doesn't ask first.
+
+---
+
+## Task lists — showing the working
+
+Anything that takes more than one step gets a list first. Oscar calls
+`plan_tasks` with what he is about to do, then `finish_task` after each one, and
+the web console renders the list ticking off as it happens.
+
+```
+you: "compare the two flights and tell me which is better"
+         │
+         ▼
+   plan_tasks({tasks: ["Find both flights", "Compare price and times", "Say which wins"]})
+         │  the console draws three tasks, the first one current
+         ▼
+   ... real work ...
+         │
+         ▼
+   finish_task({task: 1, note: "Both found — 08:10 and 14:35"})
+         │  task 1 ticks off, task 2 becomes current
+         ▼
+   ... and so on, then the answer
+```
+
+**These tools change nothing.** No database, no Google account, no write
+permission — they edit a list that lives inside the run's own state, which is
+why they are available on a deployment with nothing configured at all. The list
+is thrown away with the run; it is a progress indicator, not a record.
+
+**Numbering is assigned by the server, not the model.** `lib/tasklist.js`
+renumbers whatever list arrives from 1, and every `finish_task` result hands the
+whole renumbered list back — which is what stops the model's idea of "task 3"
+and Oscar's from drifting apart over a long run.
+
+| Tool | Write? | What it does |
+| --- | :---: | --- |
+| `plan_tasks` | | 2–12 ordered tasks, at the start of a run. Refuses a list of one |
+| `finish_task` | | Ticks task N off, with one line on how it went |
+
+### Task lists vs plans vs missions
+
+Three similar-sounding things, told apart by how long they last:
+
+| | Lives for | Stored in | You can |
+| --- | --- | --- | --- |
+| **Task list** | one run | the run's state | watch it |
+| **Plan** | until you delete it | `plans` table | tick steps off next week |
+| **Mission** | one run, working a plan | `jobs` + `plans` | watch it and keep the plan |
+
+A mission does not call `plan_tasks` — the plan it is working through IS its
+task list, and `lib/missions.js` mirrors the plan's steps into the same shape so
+the console renders both identically.
 
 ---
 

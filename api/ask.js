@@ -26,13 +26,14 @@
  * failures both. See lib/db.js for why logging can never break an answer.
  */
 
+import { randomUUID } from 'node:crypto';
 import { askAgent, createAgentState, AgentError } from '../lib/agent.js';
 import { createMissionState } from '../lib/missions.js';
 import { routeQuestion } from '../lib/router.js';
 import { createJob, createJobToken, continueJob, isJobsConfigured } from '../lib/jobs.js';
 import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
 import { applyCors, readBody, send, HttpError, clientIp } from '../lib/http.js';
-import { logConversation, conversationRow } from '../lib/db.js';
+import { logConversation, conversationRow, conversationTurns, isConfigured } from '../lib/db.js';
 import { createConfirmToken, CONFIRM_TTL_MS } from '../lib/confirm.js';
 
 /**
@@ -116,6 +117,27 @@ function requireConfirmation(via, body, env = process.env) {
 }
 
 /**
+ * Which conversation this question belongs to.
+ *
+ * The web console keeps one id for a back-and-forth and sends it with every
+ * follow-up; anything that doesn't (the Shortcut, a bare curl) gets a fresh one
+ * and is therefore a thread of exactly one turn. That uniformity is the point —
+ * the history view has one shape to render, not two.
+ *
+ * The id is only ever a KEY. It selects which rows to read back as context, and
+ * those rows were written by this server, so a caller passing someone else's id
+ * would be reading their own history at worst — there is one user. It is still
+ * shape-checked, because it ends up in a database filter.
+ */
+function readConversationId(body = {}, url) {
+  const raw = String(
+    body.conversationId || body.conversation || body.threadId || url.searchParams.get('conversation') || ''
+  ).trim();
+
+  return /^[0-9a-fA-F-]{16,40}$/.test(raw) ? raw : null;
+}
+
+/**
  * Pull coordinates out of the request.
  *
  * Shortcuts' "Get Current Location" gives you a Location variable; depending on
@@ -174,6 +196,7 @@ export default async function handler(req, res) {
   let timeZone;
   let via = null;
   let source = null;
+  let conversationId = null;
 
   try {
     const url = new URL(req.url, 'http://localhost');
@@ -213,15 +236,37 @@ export default async function handler(req, res) {
     // up differently.
     const coords = readCoords(body, url);
 
+    // ---- the conversation so far ------------------------------------------
+    // A follow-up only makes sense next to what came before it, so earlier turns
+    // are read back out of the log and put in front of the question. Read from
+    // the DATABASE rather than trusted from the request: the browser sends an
+    // id, not a transcript, so a stale or edited tab cannot rewrite what Oscar
+    // is told he said. The body's own `history` is the fallback for a
+    // deployment with no database, where there is nothing to read back.
+    const continuing = readConversationId(body, url);
+    conversationId = continuing || randomUUID();
+
+    // Started, not awaited: the classifier below is a network call too, and a
+    // follow-up should not pay for both one after the other.
+    const historyPromise =
+      continuing && isConfigured()
+        ? conversationTurns(continuing, { limit: 20 })
+        : Promise.resolve(Array.isArray(body.history) ? body.history : []);
+
     const writeAllowed = canWrite(req, via, body, url);
     const askFirst = requireConfirmation(via, body, process.env);
 
     // ---- how much machinery does this deserve? ----------------------------
     // A quick lookup answers inline in a couple of seconds. Real work becomes a
     // background job so it is not bounded by how long the caller will wait.
-    const route = await routeQuestion(question, { env: process.env, mode: body.mode });
+    const [route, history] = await Promise.all([
+      routeQuestion(question, { env: process.env, mode: body.mode }),
+      historyPromise,
+    ]);
+
     const agentInput = {
       question,
+      history,
       timeZone,
       coords,
       ip: clientIp(req),
@@ -236,15 +281,22 @@ export default async function handler(req, res) {
     const wantsMission = route.mode === 'mission' && writeAllowed;
     const backgroundMode = wantsMission ? 'mission' : route.mode === 'mission' ? 'deep' : route.mode;
 
+    // Work heading for the background has already been judged multi-step, and
+    // somebody is watching a progress panel for it. A mission is exempt: its
+    // saved plan IS the task list, so asking for a second one would show two
+    // competing versions of the same thing.
+    const backgroundAgent = { ...agentInput, requireTasks: backgroundMode === 'deep' };
+
     if (backgroundMode !== 'fast' && isJobsConfigured() && body.async !== false) {
       const job = await createJob(
         {
           question,
+          conversationId,
           mode: backgroundMode,
           model: route.model,
           state: wantsMission
             ? createMissionState(agentInput, process.env)
-            : createAgentState(agentInput, process.env),
+            : createAgentState(backgroundAgent, process.env),
           source,
           via,
         },
@@ -261,6 +313,7 @@ export default async function handler(req, res) {
       return send(res, 200, {
         ok: true,
         async: true,
+        conversationId,
         jobId: job.id,
         jobToken: createJobToken(job.id, process.env),
         status: 'queued',
@@ -286,6 +339,7 @@ export default async function handler(req, res) {
       conversationRow({
         question,
         timeZone,
+        conversationId,
         result,
         status: 200,
         via,
@@ -307,6 +361,7 @@ export default async function handler(req, res) {
 
     return send(res, 200, {
       ok: true,
+      conversationId,
       question: String(question).trim(),
       title: result.title,
       answer: result.answer,
@@ -318,6 +373,7 @@ export default async function handler(req, res) {
       model: result.model,
       elapsedMs: result.elapsedMs,
       tools: result.toolsUsed,
+      tasks: result.tasks,
       rounds: result.rounds,
       async: false,
       mode: route.mode,
@@ -342,6 +398,7 @@ export default async function handler(req, res) {
         conversationRow({
           question,
           timeZone,
+          conversationId,
           error: full,
           status,
           via,

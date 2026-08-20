@@ -70,6 +70,26 @@ alter table public.conversations add column if not exists tools_used text[];
 
 
 -- ---------------------------------------------------------------------------
+--  Conversations, as in back-and-forths
+--
+--  Each row is still one exchange — a question and its answer. What this column
+--  adds is which THREAD the exchange belongs to, so a follow-up ("and what
+--  about tomorrow?") can be shown next to the turn it refers to, and read back
+--  as context when Oscar answers it.
+--
+--  Null is a perfectly good value: a one-shot Shortcut question belongs to no
+--  thread, and every row written before this column existed has none either.
+--  Those are rendered as single-turn conversations rather than being hidden.
+-- ---------------------------------------------------------------------------
+
+alter table public.conversations add column if not exists conversation_id uuid;
+
+-- Reading one thread, oldest first, is the whole access pattern.
+create index if not exists conversations_thread_idx
+  on public.conversations (conversation_id, created_at);
+
+
+-- ---------------------------------------------------------------------------
 --  Row Level Security
 --
 --  This is the important part, so it is worth being explicit about what is
@@ -284,6 +304,19 @@ comment on table public.jobs is
 
 create index if not exists jobs_status_idx  on public.jobs (status, created_at desc);
 create index if not exists jobs_created_idx on public.jobs (created_at desc);
+
+-- Added with the task list and conversation threading. Both are safe to run
+-- again on an existing database.
+--
+--   tasks            what Oscar decided to do, and how far through it he is:
+--                    [{n, title, done, note}, ...]. Kept on the job rather than
+--                    inside `state` because `state` is deliberately thrown away
+--                    when a job finishes, while the list of what was done is
+--                    worth keeping. See lib/tasklist.js.
+--   conversation_id  which back-and-forth started this job, so its answer lands
+--                    in the right thread in History when it eventually arrives.
+alter table public.jobs add column if not exists tasks jsonb not null default '[]'::jsonb;
+alter table public.jobs add column if not exists conversation_id uuid;
 
 alter table public.jobs enable row level security;
 revoke all on public.jobs from anon, authenticated;

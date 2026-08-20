@@ -12,6 +12,18 @@
  * The session cookie is HttpOnly, so this script can't read it either. That's
  * deliberate: it means an XSS bug can't steal your session. We ask the server
  * "am I signed in?" via /api/session instead.
+ *
+ * FOUR PANES, ONE AT A TIME
+ *
+ *   ask       the conversation, plus Oscar's thinking while he has one
+ *   jobs      work too heavy to answer on the end of a request
+ *   history   every exchange, grouped back into the threads they happened in
+ *   settings  how much of the machinery you want to see, and notifications
+ *
+ * Everything rendered from server data is built with createElement and
+ * textContent, never innerHTML. Questions, answers and tool names all pass
+ * through a model and a database on their way here, which makes them exactly
+ * the kind of content that must never be parsed as markup.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -38,28 +50,47 @@ const el = {
   gateNote: $('gate-note'),
 
   tabAsk: $('tab-ask'),
+  tabJobs: $('tab-jobs'),
   tabHistory: $('tab-history'),
+  tabSettings: $('tab-settings'),
   paneAsk: $('pane-ask'),
+  paneJobs: $('pane-jobs'),
   paneHistory: $('pane-history'),
+  paneSettings: $('pane-settings'),
+
+  thread: $('thread'),
+  threadEmpty: $('thread-empty'),
+  question: $('question'),
+  mic: $('mic'),
+  send: $('send'),
+  newChat: $('new-chat'),
+
+  confirmRow: $('confirm-row'),
+  confirmNote: $('confirm-note'),
+  confirmYes: $('confirm-yes'),
+  confirmNo: $('confirm-no'),
+
+  activityStatus: $('activity-status'),
+  activityLog: $('activity-log'),
+  activityEmpty: $('activity-empty'),
+  taskPanel: $('task-panel'),
+  taskList: $('task-list'),
+  taskProgress: $('task-progress'),
+
+  jobsMeta: $('jobs-meta'),
+  jobsList: $('jobs-list'),
+  jobsRefresh: $('jobs-refresh'),
+  jobsBadge: $('jobs-badge'),
+
   search: $('search'),
   refresh: $('refresh'),
   historyMeta: $('history-meta'),
   historyList: $('history-list'),
 
-  question: $('question'),
-  mic: $('mic'),
-  send: $('send'),
-  result: $('result'),
-  confirmRow: $('confirm-row'),
-  confirmNote: $('confirm-note'),
-  confirmYes: $('confirm-yes'),
-  confirmNo: $('confirm-no'),
-  title: $('r-title'),
-  answer: $('r-answer'),
-  detail: $('r-detail'),
-  meta: $('r-meta'),
-  activityStatus: $('activity-status'),
-  activityLog: $('activity-log'),
+  setDetailed: $('set-detailed'),
+  setModel: $('set-model'),
+  setTiming: $('set-timing'),
+
   recipe: $('recipe'),
   copy: $('copy'),
   endpoint: $('endpoint'),
@@ -87,6 +118,67 @@ async function api(path, body) {
   });
   const data = await res.json().catch(() => ({}));
   return { res, data };
+}
+
+/* =============================================================== settings */
+
+/**
+ * How much of the machinery you want to see.
+ *
+ * Deliberately local to the browser rather than stored server-side: none of it
+ * changes what Oscar does, only what this screen shows, and a preference that
+ * needs a round trip to apply is a preference that feels broken.
+ *
+ * Applied as attributes on <body> so the CSS does the hiding. That matters for
+ * anything already on screen — flipping "show the model" re-styles a
+ * conversation that is already rendered, instead of needing it rebuilt.
+ */
+const SETTINGS_KEY = 'oscar.settings';
+const DEFAULT_SETTINGS = { detailed: true, model: true, timing: true };
+
+let settings = { ...DEFAULT_SETTINGS };
+
+function loadSettings() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    settings = { ...DEFAULT_SETTINGS, ...stored };
+  } catch {
+    settings = { ...DEFAULT_SETTINGS };
+  }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* private mode, or storage full. The setting still applies for this visit. */
+  }
+}
+
+function applySettings() {
+  document.body.dataset.detailed = settings.detailed ? 'on' : 'off';
+  document.body.dataset.model = settings.model ? 'on' : 'off';
+  document.body.dataset.timing = settings.timing ? 'on' : 'off';
+
+  el.setDetailed.checked = settings.detailed;
+  el.setModel.checked = settings.model;
+  el.setTiming.checked = settings.timing;
+
+  renderHealth();
+  renderActivityStatus();
+  updateActivityEmpty();
+}
+
+for (const [key, control] of [
+  ['detailed', el.setDetailed],
+  ['model', el.setModel],
+  ['timing', el.setTiming],
+]) {
+  control.addEventListener('change', () => {
+    settings[key] = control.checked;
+    saveSettings();
+    applySettings();
+  });
 }
 
 /* ============================================================== login gate */
@@ -270,24 +362,33 @@ async function enterConsole(email) {
   // This one IS the greeting the whole feature exists for — a suspended run is
   // going nowhere until it is answered.
   loadQuestions().catch(() => {});
+
+  // Quiet first pass so the Jobs tab arrives with its badge already right,
+  // rather than looking empty until you tap it.
+  loadJobs({ quiet: true }).catch(() => {});
 }
 
 function showGate() {
   setState('out');
+  stopWatching();
+  stopJobsPolling();
 
   // Clear anything the app view had rendered, so a signed-out page holds no
   // trace of the previous session even before a reload.
   el.endpoint.textContent = '';
   el.recipe.textContent = '';
   el.historyList.replaceChildren();
-  el.result.hidden = true;
+  el.jobsList.replaceChildren();
   historyLoaded = false;
+
+  newConversation();
 
   // Neither the device list nor Oscar's open questions belong on a signed-out
   // page — the questions especially, since they describe unfinished work.
   el.pushDetails.hidden = true;
   el.questionsCard.hidden = true;
   el.questionsList.replaceChildren();
+  el.jobsBadge.hidden = true;
 
   el.password.focus();
 }
@@ -307,6 +408,8 @@ function recipeText() {
 }
 
 async function init() {
+  loadSettings();
+  applySettings();
   setState('loading');
 
   try {
@@ -321,36 +424,121 @@ async function init() {
 
 /* ------------------------------------------------------------------- health */
 
+let lastHealth = { state: 'unknown', label: 'checking…', model: '' };
+
+/** Re-paints the header pill from `lastHealth`, honouring the model setting. */
+function renderHealth() {
+  el.health.dataset.state = lastHealth.state;
+  el.health.textContent =
+    lastHealth.state === 'ok' && !settings.model ? 'ready' : lastHealth.label;
+}
+
 async function checkHealth() {
   try {
     const { data } = await api('/api/health');
     if (data.agent && data.agent.openaiKey) {
-      el.health.dataset.state = 'ok';
-      el.health.textContent = String(data.agent.model).replace(' (default)', '');
+      const model = String(data.agent.model).replace(' (default)', '');
+      lastHealth = { state: 'ok', label: model, model };
     } else {
-      el.health.dataset.state = 'bad';
-      el.health.textContent = 'no API key';
+      lastHealth = { state: 'bad', label: 'no API key', model: '' };
     }
   } catch {
-    el.health.dataset.state = 'bad';
-    el.health.textContent = 'api unreachable';
+    lastHealth = { state: 'bad', label: 'api unreachable', model: '' };
   }
+  renderHealth();
 }
 
-/* ---------------------------------------------------------------- rendering */
+/* ============================================================ the conversation */
 
-function render({ ok, title, answer, detail, meta }) {
-  el.result.hidden = false;
-  // Any new render clears a stale pending confirmation. Leaving an old Yes
-  // button on screen next to a new answer is how people delete the wrong thing.
+/**
+ * One back-and-forth.
+ *
+ * The id comes from the server on the first answer and is sent with every
+ * follow-up, which is what lets "and what about tomorrow?" work: the server
+ * reads the earlier turns of this thread back out of the log and puts them in
+ * front of the question. The page deliberately does NOT send the transcript
+ * itself — a tab left open for a week would otherwise be able to rewrite what
+ * Oscar is told he said.
+ */
+let conversationId = null;
+
+/** Turn nodes are built here so the two callers can't drift apart. */
+function addTurn(role, { text = '', detail = '', ok = true, pending = false } = {}) {
+  const node = document.createElement('article');
+  node.className = `turn ${role}${ok ? '' : ' bad'}`;
+
+  const body = document.createElement('div');
+  body.className = 'turn-body';
+
+  if (pending) {
+    const typing = document.createElement('span');
+    typing.className = 'typing';
+    typing.setAttribute('aria-label', 'Oscar is thinking');
+    for (let i = 0; i < 3; i++) typing.appendChild(document.createElement('i'));
+    body.appendChild(typing);
+  } else {
+    body.textContent = text;
+  }
+
+  const detailNode = document.createElement('p');
+  detailNode.className = 'turn-detail';
+  detailNode.textContent = detail;
+  detailNode.hidden = !detail;
+
+  const metaNode = document.createElement('p');
+  metaNode.className = 'turn-meta';
+
+  node.append(body, detailNode, metaNode);
+  el.thread.appendChild(node);
+  el.threadEmpty.hidden = true;
+  scrollToEnd(node);
+
+  return { node, body, detailNode, metaNode };
+}
+
+/**
+ * Fill in a turn that was added as a placeholder.
+ *
+ * `meta` entries carry a `kind` so the Settings toggles can hide them with CSS
+ * alone: an answer already on screen loses its model name the moment you turn
+ * the setting off, with nothing re-rendered.
+ */
+function fillTurn(turn, { text = '', detail = '', ok = true, meta = [] } = {}) {
+  if (!turn) return;
+  turn.node.classList.toggle('bad', !ok);
+  turn.node.classList.remove('working');
+  turn.body.replaceChildren(document.createTextNode(text));
+  turn.detailNode.textContent = detail || '';
+  turn.detailNode.hidden = !detail;
+
+  turn.metaNode.replaceChildren(
+    ...meta
+      .filter((bit) => bit && bit.text)
+      .map((bit) => {
+        const tag = document.createElement('span');
+        tag.className = `tag${bit.kind ? ` meta-${bit.kind}` : ''}`;
+        tag.textContent = bit.text;
+        return tag;
+      })
+  );
+
+  scrollToEnd(turn.node);
+}
+
+function scrollToEnd(node) {
+  node.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** Start a fresh thread. The old one is not deleted — it is in History. */
+function newConversation() {
+  conversationId = null;
+  stopWatching();
+  el.thread.replaceChildren();
+  el.threadEmpty.hidden = false;
   hideConfirm();
-  el.result.classList.toggle('error', !ok);
-  el.title.textContent = title || 'Oscar';
-  el.answer.textContent = answer || '';
-  el.detail.textContent = detail || '';
-  el.detail.hidden = !detail;
-  el.meta.textContent = meta || '';
-  el.result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  clearLog();
+  renderTasks([]);
+  setActivity('idle', 'idle');
 }
 
 /* -------------------------------------------------------------------- asking */
@@ -369,13 +557,18 @@ async function ask() {
   const question = el.question.value.trim();
   if (!question || inFlight) return;
 
+  const dictated = cameFromMic;
   inFlight = true;
   el.send.disabled = true;
   el.send.textContent = 'Thinking…';
-  render({ ok: true, title: 'Working…', answer: question, meta: '' });
+  el.question.value = '';
+
+  addTurn('you', { text: question });
+  const reply = addTurn('oscar', { pending: true });
 
   stopWatching();
   clearLog();
+  renderTasks([]);
   setActivity('working', 'thinking');
   logLine(question, { kind: 'note' });
 
@@ -385,6 +578,8 @@ async function ask() {
     const { res, data } = await api('/api/ask', {
       question,
       tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      conversationId: conversationId || undefined,
+      dictated: dictated || undefined,
     });
 
     // The session expired while the page was open.
@@ -396,38 +591,61 @@ async function ask() {
 
     const roundTrip = Math.round(performance.now() - started);
 
+    // Every following turn belongs to the same thread as this one.
+    if (data.conversationId) conversationId = data.conversationId;
+
     // A new row exists now, so the history tab should refetch next time it opens.
     historyLoaded = false;
 
-    render({
-      ok: Boolean(data.ok),
-      title: data.title || 'Oscar failed',
-      answer: data.answer || `Server returned ${res.status}.`,
-      detail: data.detail,
-      meta: data.ok
-        ? `${data.model || 'model'} · ${data.elapsedMs ?? '?'}ms model · ${roundTrip}ms round trip`
-        : `HTTP ${res.status} · ${roundTrip}ms`,
-    });
-
-    // render() clears any previous confirmation, so this has to come after it.
-    if (data.needsConfirmation) showConfirm(data);
-
     if (data.async && data.jobId) {
-      // Heavy work. The server is already running it; follow along.
+      // Heavy work. The server is already running it; follow along, and leave
+      // the reply bubble in place to be filled in when it lands.
+      fillTurn(reply, {
+        text: data.answer || 'Working on that now.',
+        meta: [{ text: `${data.mode} · background job` }],
+      });
+      reply.node.classList.add('working');
+
       logLine('handed off to a background job', {
         kind: 'note',
         how: `${data.mode} · routed by ${data.routedBy}`,
       });
-      watchJob(data.jobId, data.jobToken);
-    } else {
-      for (const name of data.tools || []) logLine(name, { how: 'tool' });
-      setActivity(data.ok ? 'done' : 'bad', data.ok ? `done · ${data.rounds || 1} rounds` : 'failed');
-      if (data.mode) {
-        logLine(`answered inline`, { kind: 'note', how: `${data.mode} · ${data.model || ''}`.trim() });
-      }
+      watchJob(data.jobId, data.jobToken, reply);
+      loadJobs({ quiet: true }).catch(() => {});
+      return;
+    }
+
+    fillTurn(reply, {
+      ok: Boolean(data.ok),
+      text: data.answer || `Server returned ${res.status}.`,
+      detail: data.detail,
+      meta: data.ok
+        ? [
+            { text: data.model || 'model', kind: 'model' },
+            { text: `${roundTrip}ms`, kind: 'timing' },
+            data.rounds > 1 ? { text: `${data.rounds} rounds` } : null,
+          ]
+        : [{ text: `HTTP ${res.status}` }, { text: `${roundTrip}ms`, kind: 'timing' }],
+    });
+
+    // fillTurn clears nothing about a pending confirmation, so this is safe to
+    // do after it — but hideConfirm() on every new answer is not, because the
+    // answer IS the thing being confirmed.
+    if (data.needsConfirmation) showConfirm(data);
+
+    renderTasks(data.tasks || []);
+    for (const name of data.tools || []) logLine(name, { how: 'tool' });
+    setActivity(data.ok ? 'done' : 'bad', data.ok ? `done · ${data.rounds || 1} rounds` : 'failed');
+    if (data.mode) {
+      logLine('answered inline', { kind: 'note', how: `${data.mode} · ${data.model || ''}`.trim() });
     }
   } catch (err) {
-    render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
+    fillTurn(reply, {
+      ok: false,
+      text: String((err && err.message) || err),
+      meta: [{ text: 'network error' }],
+    });
+    setActivity('bad', 'failed');
   } finally {
     inFlight = false;
     cameFromMic = false;
@@ -443,6 +661,12 @@ async function ask() {
  * work is NOT held open on an HTTP connection — it runs server-side across as
  * many invocations as it needs, and this panel watches it.
  *
+ * Two things are rendered here, and they answer different questions. The TASK
+ * LIST says what Oscar decided to do and where he has got to, in his own words;
+ * the LOG says which tool ran when. Settings decides whether you see both or
+ * just the first — a tool trace is the right thing to look at when something
+ * has gone wrong, and noise the rest of the time.
+ *
  * Everything is mirrored to console.log too, so the browser devtools give you
  * the same trace without the UI.
  */
@@ -450,13 +674,97 @@ async function ask() {
 let pollTimer = null;
 let watchingJob = null;
 
+/**
+ * The pill next to "Oscar's thinking".
+ *
+ * Two labels, not one. The detailed label is the true one — "running · 12
+ * steps" — and the plain one says the same thing without the vocabulary, for
+ * when detailed thinking is off. Kept in a variable so flipping the setting
+ * re-labels a pill that is already on screen.
+ */
+const PLAIN_STATUS = { idle: 'idle', working: 'working', done: 'done', bad: 'stopped' };
+
+let lastActivity = { state: 'idle', label: 'idle' };
+
 function setActivity(state, label) {
-  el.activityStatus.dataset.state = state;
-  el.activityStatus.textContent = label;
+  lastActivity = { state, label };
+  renderActivityStatus();
+}
+
+function renderActivityStatus() {
+  el.activityStatus.dataset.state = lastActivity.state;
+  el.activityStatus.textContent = settings.detailed
+    ? lastActivity.label
+    : PLAIN_STATUS[lastActivity.state] || lastActivity.label;
 }
 
 function clearLog() {
   el.activityLog.replaceChildren();
+  updateActivityEmpty();
+}
+
+/** The "nothing here yet" line, which depends on what each mode can show. */
+function updateActivityEmpty() {
+  const hasTasks = !el.taskPanel.hidden;
+  const hasLog = el.activityLog.childElementCount > 0 && settings.detailed;
+  el.activityEmpty.hidden = hasTasks || hasLog;
+  el.activityEmpty.textContent = settings.detailed
+    ? 'Ask something. Tool calls and progress appear here as they happen.'
+    : 'Ask something. Oscar shows the tasks he is working through here.';
+}
+
+/**
+ * What Oscar decided to do, and how far through it he is.
+ *
+ * The list arrives from the server the same way for both kinds of run: an
+ * ordinary job builds it by calling plan_tasks, and a mission mirrors the steps
+ * of its saved plan into the same shape. This function does not care which.
+ */
+function renderTasks(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+
+  el.taskPanel.hidden = list.length === 0;
+  if (!list.length) {
+    el.taskList.replaceChildren();
+    el.taskProgress.textContent = '';
+    updateActivityEmpty();
+    return;
+  }
+
+  const done = list.filter((task) => task.done).length;
+  const current = list.find((task) => !task.done) || null;
+
+  el.taskProgress.textContent = current
+    ? `Task ${current.n} of ${list.length} · ${done} done`
+    : `All ${list.length} tasks done`;
+
+  el.taskList.replaceChildren(
+    ...list.map((task) => {
+      const item = document.createElement('li');
+      item.className = task.done ? 'done' : current && task.n === current.n ? 'now' : '';
+
+      const mark = document.createElement('span');
+      mark.className = 'task-mark';
+      mark.setAttribute('aria-hidden', 'true');
+
+      const title = document.createElement('span');
+      title.className = 'task-title';
+      title.textContent = task.title;
+
+      item.append(mark, title);
+
+      if (task.note) {
+        const note = document.createElement('span');
+        note.className = 'task-note';
+        note.textContent = task.note;
+        item.append(note);
+      }
+
+      return item;
+    })
+  );
+
+  updateActivityEmpty();
 }
 
 /**
@@ -469,9 +777,10 @@ function logLine(what, { kind = '', how = '' } = {}) {
 
   const tick = document.createElement('span');
   tick.className = 'tick';
-  tick.textContent = new Date().toLocaleTimeString(undefined, {
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  }).replace(/^(\d)/, '0$1').slice(-8);
+  tick.textContent = new Date()
+    .toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    .replace(/^(\d)/, '0$1')
+    .slice(-8);
 
   const body = document.createElement('span');
   body.className = 'what';
@@ -483,7 +792,8 @@ function logLine(what, { kind = '', how = '' } = {}) {
 
   li.append(tick, body, note);
   el.activityLog.appendChild(li);
-  el.activityLog.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  updateActivityEmpty();
+  if (settings.detailed) el.activityLog.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   console.log(`[oscar] ${what}${how ? ` — ${how}` : ''}`);
   return li;
 }
@@ -515,8 +825,10 @@ function renderEvents(events, alreadyShown) {
  * backgrounded, reconnects for free, and needs no server-side connection state.
  * Each poll also nudges the job along if its self-continuation was ever lost —
  * which is why a dropped hop is recoverable rather than fatal.
+ *
+ * @param {object} [reply] the turn in the thread this job is answering, if any.
  */
-async function watchJob(jobId, token) {
+async function watchJob(jobId, token, reply) {
   stopWatching();
   watchingJob = jobId;
 
@@ -535,25 +847,29 @@ async function watchJob(jobId, token) {
       if (!job) throw new Error(data.error || 'Job not found.');
 
       shown = renderEvents(job.events || [], shown);
+      renderTasks(job.tasks || []);
 
       if (job.status === 'done') {
         setActivity('done', `done · ${job.steps} steps`);
         logLine('finished', { kind: 'note', how: `${job.steps} steps` });
-        render({
-          ok: true,
-          title: job.title || 'Done',
-          answer: job.answer || '',
+        fillTurn(reply, {
+          text: job.answer || 'Done.',
           detail: job.detail,
-          meta: `${job.model || 'model'} · ${job.steps} steps · background job`,
+          meta: [
+            { text: job.model || 'model', kind: 'model' },
+            { text: `${job.steps} steps` },
+            { text: 'background job' },
+          ],
         });
         historyLoaded = false;
+        loadJobs({ quiet: true }).catch(() => {});
         return stopWatching();
       }
 
       if (job.status === 'awaiting_confirm') {
         setActivity('working', 'waiting on you');
         logLine('needs your confirmation', { kind: 'note' });
-        render({ ok: true, title: job.title || 'Confirm', answer: job.answer || '' });
+        fillTurn(reply, { text: job.answer || 'Can I go ahead?' });
         if (job.pendingConfirmation) {
           showConfirm({ confirmToken: null, confirmExpiresInSeconds: 300 });
         }
@@ -563,8 +879,8 @@ async function watchJob(jobId, token) {
       if (job.status === 'awaiting_answer') {
         setActivity('working', 'waiting on you');
         logLine('has a question for you', { kind: 'note' });
-        render({ ok: true, title: job.title || 'A question', answer: job.answer || '' });
-        // The question card at the top of the page is where it gets answered,
+        fillTurn(reply, { text: job.answer || 'I have a question.' });
+        // The question card at the top of the pane is where it gets answered,
         // so bring it up rather than building a second answer box down here.
         loadQuestions().catch(() => {});
         return stopWatching();
@@ -573,7 +889,8 @@ async function watchJob(jobId, token) {
       if (job.status === 'failed') {
         setActivity('bad', 'failed');
         logLine(job.error || 'failed', { kind: 'bad' });
-        render({ ok: false, title: 'Oscar failed', answer: job.error || 'The job failed.' });
+        fillTurn(reply, { ok: false, text: job.error || 'The job failed.' });
+        historyLoaded = false;
         return stopWatching();
       }
 
@@ -629,17 +946,25 @@ async function resolveConfirm(agreed) {
   el.confirmNo.disabled = true;
   el.confirmYes.textContent = agreed ? 'Deleting…' : 'Yes, delete';
 
+  const reply = addTurn('oscar', { pending: true });
+
   try {
-    const { res, data } = await api('/api/confirm', { token, confirm: agreed });
-    render({
+    const { res, data } = await api('/api/confirm', {
+      token,
+      confirm: agreed,
+      // So the outcome is logged into the thread it came from rather than
+      // landing in History on its own.
+      conversationId: conversationId || undefined,
+    });
+    hideConfirm();
+    fillTurn(reply, {
       ok: Boolean(data.ok),
-      title: data.title || (agreed ? 'Done' : 'Cancelled'),
-      answer: data.answer || '',
-      meta: data.ok ? '' : `HTTP ${res.status}`,
+      text: data.answer || (agreed ? 'Done.' : 'Cancelled.'),
+      meta: data.ok ? [] : [{ text: `HTTP ${res.status}` }],
     });
     historyLoaded = false;
   } catch (err) {
-    render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
+    fillTurn(reply, { ok: false, text: String((err && err.message) || err) });
   } finally {
     el.confirmYes.textContent = 'Yes, delete';
   }
@@ -648,21 +973,44 @@ async function resolveConfirm(agreed) {
 el.confirmYes.addEventListener('click', () => resolveConfirm(true));
 el.confirmNo.addEventListener('click', () => resolveConfirm(false));
 
-/* ============================================================ history tab */
+/* ================================================================ tabs */
 
 let historyLoaded = false;
 
-function showTab(which) {
-  const history = which === 'history';
-  el.tabAsk.classList.toggle('on', !history);
-  el.tabHistory.classList.toggle('on', history);
-  el.tabAsk.setAttribute('aria-selected', String(!history));
-  el.tabHistory.setAttribute('aria-selected', String(history));
-  el.paneAsk.hidden = history;
-  el.paneHistory.hidden = !history;
+const TABS = {
+  ask: { tab: el.tabAsk, pane: el.paneAsk },
+  jobs: { tab: el.tabJobs, pane: el.paneJobs },
+  history: { tab: el.tabHistory, pane: el.paneHistory },
+  settings: { tab: el.tabSettings, pane: el.paneSettings },
+};
 
-  if (history && !historyLoaded) loadHistory();
+let currentTab = 'ask';
+
+function showTab(which) {
+  currentTab = TABS[which] ? which : 'ask';
+
+  for (const [name, { tab, pane }] of Object.entries(TABS)) {
+    const on = name === currentTab;
+    tab.classList.toggle('on', on);
+    tab.setAttribute('aria-selected', String(on));
+    pane.hidden = !on;
+  }
+
+  if (currentTab === 'history' && !historyLoaded) loadHistory();
+
+  // Polling follows the tab: a job list nobody is looking at does not need to
+  // be a second apart, and the badge is refreshed by the ask flow anyway.
+  if (currentTab === 'jobs') loadJobs();
+  else stopJobsPolling();
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
+
+for (const [name, { tab }] of Object.entries(TABS)) {
+  tab.addEventListener('click', () => showTab(name));
+}
+
+/* --------------------------------------------------------------- formatting */
 
 /** Local time, and a relative hint for anything recent. */
 function formatWhen(iso) {
@@ -674,55 +1022,340 @@ function formatWhen(iso) {
   return when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
-/**
- * Built with createElement rather than innerHTML on purpose: these strings come
- * back from a database, and textContent can't be tricked into executing markup.
- */
-function entryNode(row) {
+/** Meta tags, with the two that Settings can hide marked as such. */
+function tagRow(bits) {
+  const row = document.createElement('div');
+  row.className = 'entry-meta';
+  for (const bit of bits) {
+    if (!bit || !bit.text) continue;
+    const tag = document.createElement('span');
+    tag.className = `tag${bit.kind ? ` meta-${bit.kind}` : ''}`;
+    tag.textContent = bit.text;
+    row.appendChild(tag);
+  }
+  return row;
+}
+
+/* ================================================================= jobs tab */
+
+/** Statuses that mean the job has not finished with you yet. */
+const ACTIVE_STATUSES = new Set(['queued', 'running', 'awaiting_confirm', 'awaiting_answer']);
+
+const STATUS_LABEL = {
+  queued: 'queued',
+  running: 'running',
+  awaiting_confirm: 'needs a yes/no',
+  awaiting_answer: 'needs an answer',
+  done: 'done',
+  failed: 'failed',
+  cancelled: 'cancelled',
+};
+
+let jobsTimer = null;
+
+function stopJobsPolling() {
+  clearTimeout(jobsTimer);
+  jobsTimer = null;
+}
+
+function jobNode(job) {
   const node = document.createElement('article');
-  node.className = `entry${row.ok ? '' : ' bad'}`;
+  const active = ACTIVE_STATUSES.has(job.status);
+  node.className = `entry job${job.status === 'failed' ? ' bad' : ''}${active ? ' live' : ''}`;
+
+  const head = document.createElement('div');
+  head.className = 'job-head';
 
   const question = document.createElement('div');
   question.className = 'entry-q';
-  question.textContent = row.question || '(empty)';
+  question.textContent = job.question || '(no question)';
+
+  const pill = document.createElement('span');
+  pill.className = 'pill';
+  pill.dataset.state = active ? 'working' : job.status === 'done' ? 'done' : 'bad';
+  pill.textContent = STATUS_LABEL[job.status] || job.status;
+
+  head.append(question, pill);
+  node.append(head);
+
+  if (job.answer || job.error) {
+    const answer = document.createElement('div');
+    answer.className = 'entry-a';
+    answer.textContent = job.error || job.answer;
+    node.append(answer);
+  }
+
+  // The task list, which is the honest answer to "what is it doing right now".
+  const tasks = Array.isArray(job.tasks) ? job.tasks : [];
+  if (tasks.length) {
+    const done = tasks.filter((task) => task.done).length;
+    const current = tasks.find((task) => !task.done) || null;
+
+    const progress = document.createElement('p');
+    progress.className = 'tasks-head';
+    progress.textContent = current
+      ? `Task ${current.n} of ${tasks.length} · ${done} done`
+      : `All ${tasks.length} tasks done`;
+
+    const list = document.createElement('ol');
+    list.className = 'tasks-list';
+    for (const task of tasks) {
+      const item = document.createElement('li');
+      item.className = task.done ? 'done' : current && task.n === current.n ? 'now' : '';
+      const mark = document.createElement('span');
+      mark.className = 'task-mark';
+      mark.setAttribute('aria-hidden', 'true');
+      const title = document.createElement('span');
+      title.className = 'task-title';
+      title.textContent = task.title;
+      item.append(mark, title);
+      list.append(item);
+    }
+
+    node.append(progress, list);
+  }
+
+  node.append(
+    tagRow([
+      { text: formatWhen(job.createdAt) },
+      job.mode ? { text: job.mode } : null,
+      job.steps ? { text: `${job.steps} steps` } : null,
+      { text: job.model || '', kind: 'model' },
+    ])
+  );
+
+  // A finished job's answer is a turn in a conversation, so the useful action
+  // is to open that conversation rather than to re-read it here.
+  if (job.conversationId) {
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'ghost small';
+    open.textContent = 'Open conversation';
+    open.addEventListener('click', () => openThread(job.conversationId));
+    node.append(open);
+  }
+
+  return node;
+}
+
+/**
+ * @param {{quiet?: boolean}} [opts] quiet means "refresh the badge, don't touch
+ *        the meta line" — used when the Jobs tab isn't the one on screen.
+ */
+async function loadJobs(opts = {}) {
+  stopJobsPolling();
+  if (!opts.quiet) el.jobsMeta.textContent = 'Loading…';
+
+  try {
+    const { res, data } = await api('/api/jobs?limit=25');
+
+    if (res.status === 401) {
+      if (!opts.quiet) {
+        showGate();
+        showGateError('Your session expired. Sign in again.');
+      }
+      return;
+    }
+
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    const active = jobs.filter((job) => ACTIVE_STATUSES.has(job.status));
+
+    el.jobsBadge.textContent = String(active.length);
+    el.jobsBadge.hidden = active.length === 0;
+
+    if (opts.quiet) return;
+
+    if (data.configured === false) {
+      el.jobsMeta.textContent = '';
+      el.jobsList.replaceChildren(emptyLine(
+        'No database configured, so there is nowhere to keep a background job. ' +
+          'Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY — see SUPABASE.md.'
+      ));
+      return;
+    }
+
+    if (!data.ok) {
+      el.jobsMeta.textContent = data.error || 'Could not load jobs.';
+      return;
+    }
+
+    el.jobsMeta.textContent = jobs.length
+      ? `${active.length} running · ${jobs.length} recent`
+      : 'Nothing has needed a background job yet.';
+
+    el.jobsList.replaceChildren(
+      ...(jobs.length ? jobs.map(jobNode) : [emptyLine('Ask for something big and it will appear here.')])
+    );
+
+    // Only keep polling while something is actually moving.
+    if (active.length && currentTab === 'jobs') {
+      jobsTimer = setTimeout(() => loadJobs(), 4000);
+    }
+  } catch (err) {
+    if (!opts.quiet) el.jobsMeta.textContent = String((err && err.message) || err);
+  }
+}
+
+function emptyLine(text) {
+  const empty = document.createElement('p');
+  empty.className = 'empty';
+  empty.textContent = text;
+  return empty;
+}
+
+el.jobsRefresh.addEventListener('click', () => loadJobs());
+
+/* ============================================================== history tab */
+
+/**
+ * Group rows back into the conversations they happened in.
+ *
+ * Each stored row is one exchange. Rows that share a conversation id were one
+ * back-and-forth and are shown as a single item you can reopen; rows with no id
+ * — a Shortcut question, or anything logged before conversations existed — are
+ * threads of one, which is exactly what they were.
+ *
+ * Rows arrive newest-first and stay that way, so `rows[0]` is the latest turn.
+ */
+function groupThreads(rows) {
+  const byKey = new Map();
+
+  for (const row of rows) {
+    const key = row.conversation_id || `row:${row.id}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, conversationId: row.conversation_id || null, rows: [] });
+    }
+    byKey.get(key).rows.push(row);
+  }
+
+  return [...byKey.values()];
+}
+
+function threadNode(thread) {
+  const latest = thread.rows[0];
+  const first = thread.rows[thread.rows.length - 1];
+  const turns = thread.rows.length;
+
+  const node = document.createElement('article');
+  node.className = `entry${latest.ok ? '' : ' bad'}${thread.conversationId ? ' openable' : ''}`;
+
+  const question = document.createElement('div');
+  question.className = 'entry-q';
+  question.textContent = first.question || '(empty)';
 
   const answer = document.createElement('div');
   answer.className = 'entry-a';
-  answer.textContent = row.ok ? row.answer || '' : row.error || 'failed';
+  answer.textContent = latest.ok ? latest.answer || '' : latest.error || 'failed';
 
-  const meta = document.createElement('div');
-  meta.className = 'entry-meta';
+  node.append(question, answer);
 
-  const bits = [
-    formatWhen(row.created_at),
-    row.source || row.via,
-    row.model,
-    row.total_ms ? `${row.total_ms}ms` : null,
-    row.total_tokens ? `${row.total_tokens} tokens` : null,
-  ].filter(Boolean);
+  // Only the middle of a longer thread is worth spelling out — the first
+  // question and the last answer are already above.
+  if (turns > 1) {
+    const more = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.className = 'meta';
+    summary.textContent = `${turns} turns`;
+    more.append(summary);
 
-  for (const bit of bits) {
-    const tag = document.createElement('span');
-    tag.className = 'tag';
-    tag.textContent = bit;
-    meta.appendChild(tag);
-  }
+    for (const row of [...thread.rows].reverse()) {
+      const q = document.createElement('div');
+      q.className = 'entry-q small-q';
+      q.textContent = row.question || '(empty)';
+      const a = document.createElement('div');
+      a.className = 'entry-a';
+      a.textContent = row.ok ? row.answer || '' : row.error || 'failed';
+      more.append(q, a);
+    }
 
-  node.append(question, answer, meta);
-
-  if (row.detail) {
+    node.append(more);
+  } else if (latest.detail) {
     const detail = document.createElement('details');
     const summary = document.createElement('summary');
     summary.textContent = 'more';
     summary.className = 'meta';
     const body = document.createElement('div');
     body.className = 'entry-a';
-    body.textContent = row.detail;
+    body.textContent = latest.detail;
     detail.append(summary, body);
-    node.insertBefore(detail, meta);
+    node.append(detail);
+  }
+
+  node.append(
+    tagRow([
+      { text: formatWhen(latest.created_at) },
+      turns > 1 ? { text: `${turns} turns` } : null,
+      { text: latest.source || latest.via || '' },
+      { text: latest.model || '', kind: 'model' },
+      { text: latest.total_ms ? `${latest.total_ms}ms` : '', kind: 'timing' },
+      { text: latest.total_tokens ? `${latest.total_tokens} tokens` : '' },
+    ])
+  );
+
+  if (thread.conversationId) {
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'ghost small';
+    open.textContent = 'Continue this conversation';
+    open.addEventListener('click', () => openThread(thread.conversationId));
+    node.append(open);
   }
 
   return node;
+}
+
+/**
+ * Reopen a thread in the Ask pane and carry on with it.
+ *
+ * The turns are re-fetched rather than reused from the history card, because
+ * the card only holds what the list query returned — and a thread is read back
+ * oldest-first, which is the order it needs to be shown in.
+ */
+async function openThread(id) {
+  showTab('ask');
+  stopWatching();
+  clearLog();
+  renderTasks([]);
+  setActivity('idle', 'idle');
+  hideConfirm();
+
+  conversationId = id;
+  el.thread.replaceChildren();
+  el.threadEmpty.hidden = false;
+  el.threadEmpty.textContent = 'Loading this conversation…';
+
+  try {
+    const { data } = await api(`/api/history?conversation=${encodeURIComponent(id)}&limit=50`);
+    const rows = (data && data.rows) || [];
+
+    if (!rows.length) {
+      el.threadEmpty.textContent = 'That conversation has no turns left to show.';
+      return;
+    }
+
+    for (const row of rows) {
+      addTurn('you', { text: row.question || '' });
+      const reply = addTurn('oscar', {});
+      fillTurn(reply, {
+        ok: Boolean(row.ok),
+        text: row.ok ? row.answer || '' : row.error || 'failed',
+        detail: row.detail,
+        meta: [
+          { text: formatWhen(row.created_at) },
+          { text: row.model || '', kind: 'model' },
+          { text: row.total_ms ? `${row.total_ms}ms` : '', kind: 'timing' },
+        ],
+      });
+    }
+
+    el.question.focus();
+  } catch (err) {
+    el.threadEmpty.textContent = String((err && err.message) || err);
+  } finally {
+    // Restore the standing invitation for whenever the thread is cleared next.
+    if (el.thread.childElementCount) el.threadEmpty.hidden = true;
+    else el.threadEmpty.textContent = 'Ask Oscar anything. Follow-ups carry on from the answer before them.';
+  }
 }
 
 async function loadHistory() {
@@ -746,11 +1379,12 @@ async function loadHistory() {
 
     if (data.configured === false) {
       el.historyMeta.textContent = '';
-      const empty = document.createElement('p');
-      empty.className = 'empty';
-      empty.textContent =
-        'No database configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel to start logging — see SUPABASE.md.';
-      el.historyList.appendChild(empty);
+      el.historyList.appendChild(
+        emptyLine(
+          'No database configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel to ' +
+            'start logging — see SUPABASE.md.'
+        )
+      );
       return;
     }
 
@@ -760,20 +1394,23 @@ async function loadHistory() {
     }
 
     const rows = data.rows || [];
+    const threads = groupThreads(rows);
+
     el.historyMeta.textContent = rows.length
-      ? `${rows.length} most recent${term ? ` matching “${term}”` : ''}`
+      ? `${threads.length} conversation${threads.length === 1 ? '' : 's'}, ${rows.length} turn${
+          rows.length === 1 ? '' : 's'
+        }${term ? ` matching “${term}”` : ''}`
       : '';
 
-    if (!rows.length) {
-      const empty = document.createElement('p');
-      empty.className = 'empty';
-      empty.textContent = term ? 'Nothing matches that search.' : 'Nothing logged yet. Ask something.';
-      el.historyList.appendChild(empty);
+    if (!threads.length) {
+      el.historyList.appendChild(
+        emptyLine(term ? 'Nothing matches that search.' : 'Nothing logged yet. Ask something.')
+      );
       return;
     }
 
     const fragment = document.createDocumentFragment();
-    for (const row of rows) fragment.appendChild(entryNode(row));
+    for (const thread of threads) fragment.appendChild(threadNode(thread));
     el.historyList.appendChild(fragment);
   } catch (err) {
     el.historyMeta.textContent = String((err && err.message) || err);
@@ -788,8 +1425,6 @@ el.search.addEventListener('input', () => {
 });
 
 el.refresh.addEventListener('click', loadHistory);
-el.tabAsk.addEventListener('click', () => showTab('ask'));
-el.tabHistory.addEventListener('click', () => showTab('history'));
 
 /* ------------------------------------------------------ dictation (optional) */
 // Web Speech API where it exists (Chrome, Safari). Convenience for testing in a
@@ -1161,6 +1796,10 @@ if ('serviceWorker' in navigator) {
 /* ------------------------------------------------------------------- wiring */
 
 el.send.addEventListener('click', ask);
+el.newChat.addEventListener('click', () => {
+  newConversation();
+  el.question.focus();
+});
 
 el.question.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') ask();

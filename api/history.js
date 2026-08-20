@@ -2,6 +2,7 @@
  * api/history.js
  * ----------------------------------------------------------------------------
  * GET /api/history?limit=25&q=egg
+ * GET /api/history?conversation=<uuid>     one thread, in the order it happened
  *
  * Reads back what has been logged.
  *
@@ -47,6 +48,9 @@ export default async function handler(req, res) {
     limit: url.searchParams.get('limit'),
     search: url.searchParams.get('q'),
     before: url.searchParams.get('before'),
+    // ?conversation=<uuid> reads one thread, oldest turn first — that is how
+    // the console reopens a back-and-forth you had earlier.
+    conversation: url.searchParams.get('conversation'),
   });
 
   if (!result.ok) {

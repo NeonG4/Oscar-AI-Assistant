@@ -173,14 +173,17 @@ you. Writes need a second one.
 
 ## Stage 3 — Logging (~10 min, optional)
 
-Gives you the History tab, real cost numbers, and the foundation for the
-"learn about me" feature later.
+Gives you the History and Jobs tabs, real cost numbers, back-and-forth
+conversations (the earlier turns are read back out of this table), and the
+foundation for the "learn about me" feature later.
 
 - [ ] **3.1** New project at <https://supabase.com>, named `oscar`.
       Pick the region closest to your Vercel deployment — the insert is on your
       request's critical path.
 - [ ] **3.2** SQL Editor → New query → paste all of `db/schema.sql` → Run.
-      Safe to re-run.
+      Safe to re-run — and worth re-running after any update, since new columns
+      arrive that way. Conversations and job task lists both need columns added
+      after the first release.
 - [ ] **3.3** Project Settings → API → copy **Project URL** and the
       **`service_role`** key.
 

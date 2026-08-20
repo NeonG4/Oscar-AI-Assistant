@@ -108,6 +108,12 @@
     </main>
 
     <!-- ======================= APP ======================= -->
+    <!--
+      Four panes, one visible at a time, chosen by the floating tab bar at the
+      bottom of the screen. The bar is at the BOTTOM rather than under the
+      header because this is a phone app first, and the top of a tall screen is
+      the one place a thumb cannot comfortably reach.
+    -->
     <main class="shell" id="view-app" hidden>
       <header class="head">
         <div class="mark" aria-hidden="true"></div>
@@ -119,109 +125,103 @@
         <button id="signout" class="ghost small" type="button">Sign out</button>
       </header>
 
-      <nav class="tabs" role="tablist">
-        <button class="tab on" id="tab-ask" role="tab" aria-selected="true" type="button">
-          Ask
-        </button>
-        <button class="tab" id="tab-history" role="tab" aria-selected="false" type="button">
-          History
-        </button>
-      </nav>
-
       <!-- ---------------------- ask ---------------------- -->
-      <div id="pane-ask">
+      <div id="pane-ask" class="pane">
         <!--
           What Oscar is waiting to hear from you. Deliberately the first thing
-          on the page and above the ask box: a run is suspended until one of
-          these is answered, so burying it below the fold would mean work
-          quietly sitting still.
+          on the page: a run is suspended until one of these is answered, so
+          burying it below the fold would mean work quietly sitting still.
         -->
         <section class="card questions" id="questions-card" hidden aria-labelledby="questions-h">
           <h2 id="questions-h">Oscar is waiting on you</h2>
           <ul class="questions-list" id="questions-list"></ul>
         </section>
 
-        <section class="card" aria-labelledby="ask-h">
-          <h2 id="ask-h" class="sr-only">Ask a question</h2>
+        <!--
+          The conversation itself: one thread of turns, held together by a
+          conversation id the server hands back. That id is also what makes a
+          follow-up mean anything — the server reads the earlier turns back out
+          of the log and puts them in front of the question.
+        -->
+        <div class="thread" id="thread" aria-live="polite"></div>
 
-          <label class="field">
-            <span class="label">Question</span>
-            <textarea
-              id="question"
-              rows="3"
-              placeholder="Ask anything — press Cmd/Ctrl + Enter to send"
-            ></textarea>
-          </label>
+        <p class="empty subtle" id="thread-empty">
+          Ask Oscar anything. Follow-ups carry on from the answer before them.
+        </p>
 
+        <div class="card confirm-card" id="confirm-row" hidden>
+          <p class="confirm-note" id="confirm-note">This cannot be undone.</p>
           <div class="actions">
-            <button id="mic" class="ghost" type="button" title="Dictate (Chrome/Safari)">
-              <span class="dot" aria-hidden="true"></span> Speak
-            </button>
-            <button id="send" class="primary" type="button">Ask Oscar</button>
+            <button id="confirm-no" class="ghost" type="button">No, cancel</button>
+            <button id="confirm-yes" class="danger" type="button">Yes, delete</button>
           </div>
-        </section>
+        </div>
 
-        <section class="card result" id="result" hidden aria-live="polite">
-          <div class="notif">
-            <div class="notif-app">OSCAR · now</div>
-            <div class="notif-title" id="r-title"></div>
-            <div class="notif-body" id="r-answer"></div>
-          </div>
-          <p class="detail" id="r-detail" hidden></p>
-
-          <div class="confirm" id="confirm-row" hidden>
-            <p class="confirm-note" id="confirm-note">This cannot be undone.</p>
-            <div class="actions">
-              <button id="confirm-no" class="ghost" type="button">No, cancel</button>
-              <button id="confirm-yes" class="danger" type="button">Yes, delete</button>
-            </div>
-          </div>
-
-          <p class="meta" id="r-meta"></p>
-        </section>
-
-        <!-- Oscar's thinking. This is the PWA shell: when a question is
-             heavy enough to become a background job, the work streams here
-             instead of the caller waiting on an HTTP response. -->
+        <!--
+          Oscar's thinking. Two modes, chosen in Settings: the detailed one is
+          the full trace of every tool call and round, and the plain one is the
+          task list alone. The task list shows in both — it is the part that
+          says what is actually happening, in words rather than tool names.
+        -->
         <section class="card activity" aria-labelledby="activity-h">
           <div class="activity-head">
             <h2 id="activity-h">Oscar's thinking</h2>
             <span class="pill" id="activity-status" data-state="idle">idle</span>
           </div>
 
+          <div class="tasks" id="task-panel" hidden>
+            <p class="tasks-head"><span id="task-progress"></span></p>
+            <ol class="tasks-list" id="task-list"></ol>
+          </div>
+
           <ol class="log" id="activity-log" aria-live="polite"></ol>
+
           <p class="empty subtle" id="activity-empty">
-            Ask something. Tool calls and progress appear here as they happen.
+            Ask something. Progress appears here as it happens.
           </p>
+        </section>
 
-          <details class="recipe-details">
-            <summary class="meta">Shortcut endpoint</summary>
-            <pre class="code" id="recipe"></pre>
-            <button id="copy" class="ghost small" type="button">Copy endpoint URL</button>
-          </details>
+        <!-- Sticky, so the box you type in stays where your thumb left it
+             however long the conversation gets. -->
+        <section class="card composer" aria-labelledby="ask-h">
+          <h2 id="ask-h" class="sr-only">Ask a question</h2>
 
-          <!--
-            Notifications. Hidden entirely until /api/push says it is set up,
-            because a button that can only fail is worse than no button.
-          -->
-          <details class="recipe-details" id="push-details" hidden>
-            <summary class="meta">Notifications</summary>
-            <p class="meta subtle" id="push-status">Checking…</p>
-            <div class="row">
-              <button id="push-enable" class="ghost small" type="button">
-                Turn on notifications
-              </button>
-              <button id="push-test" class="ghost small" type="button" hidden>
-                Send a test
-              </button>
-            </div>
-            <p class="meta subtle" id="push-hint" hidden></p>
-          </details>
+          <textarea
+            id="question"
+            rows="2"
+            placeholder="Ask anything — press Cmd/Ctrl + Enter to send"
+          ></textarea>
+
+          <div class="actions">
+            <button id="new-chat" class="ghost small" type="button" title="Start a fresh thread">
+              New chat
+            </button>
+            <span class="spacer"></span>
+            <button id="mic" class="ghost" type="button" title="Dictate (Chrome/Safari)">
+              <span class="dot" aria-hidden="true"></span> Speak
+            </button>
+            <button id="send" class="primary" type="button">Ask Oscar</button>
+          </div>
         </section>
       </div>
 
+      <!-- ---------------------- jobs ---------------------- -->
+      <!-- Anything heavier than a lookup runs as a background job rather than
+           on the end of an HTTP connection. This is where you watch them. -->
+      <div id="pane-jobs" class="pane" hidden>
+        <section class="card">
+          <div class="row">
+            <p class="meta" id="jobs-meta">Loading…</p>
+            <span class="spacer"></span>
+            <button id="jobs-refresh" class="ghost small" type="button">Refresh</button>
+          </div>
+        </section>
+
+        <div id="jobs-list" class="jobs"></div>
+      </div>
+
       <!-- -------------------- history -------------------- -->
-      <div id="pane-history" hidden>
+      <div id="pane-history" class="pane" hidden>
         <section class="card">
           <div class="row">
             <input
@@ -238,9 +238,106 @@
         <div id="history-list" class="history"></div>
       </div>
 
+      <!-- -------------------- settings -------------------- -->
+      <div id="pane-settings" class="pane" hidden>
+        <section class="card" aria-labelledby="display-h">
+          <h2 id="display-h">Display</h2>
+
+          <label class="toggle">
+            <input type="checkbox" id="set-detailed" checked />
+            <span>
+              <b>Detailed thinking</b>
+              <em>
+                Every tool call and round, as it happens. Turn it off and Oscar's
+                thinking shows only the tasks he is working through.
+              </em>
+            </span>
+          </label>
+
+          <label class="toggle">
+            <input type="checkbox" id="set-model" checked />
+            <span>
+              <b>Show the model</b>
+              <em>Which model answered, under each reply and in the header.</em>
+            </span>
+          </label>
+
+          <label class="toggle">
+            <input type="checkbox" id="set-timing" checked />
+            <span>
+              <b>Show round trip time</b>
+              <em>How long each answer took, in milliseconds.</em>
+            </span>
+          </label>
+
+          <p class="meta subtle">Saved on this device only.</p>
+        </section>
+
+        <!--
+          Notifications. Hidden entirely until /api/push says it is set up,
+          because a button that can only fail is worse than no button.
+        -->
+        <section class="card" id="push-details" hidden aria-labelledby="push-h">
+          <h2 id="push-h">Notifications</h2>
+          <p class="meta subtle" id="push-status">Checking…</p>
+          <div class="row">
+            <button id="push-enable" class="ghost small" type="button">
+              Turn on notifications
+            </button>
+            <button id="push-test" class="ghost small" type="button" hidden>Send a test</button>
+          </div>
+          <p class="meta subtle" id="push-hint" hidden></p>
+        </section>
+
+        <section class="card" aria-labelledby="shortcut-h">
+          <h2 id="shortcut-h">Shortcut endpoint</h2>
+          <pre class="code" id="recipe"></pre>
+          <button id="copy" class="ghost small" type="button">Copy endpoint URL</button>
+        </section>
+      </div>
+
       <footer class="foot">
         <span id="endpoint"></span>
       </footer>
+
+      <!-- The tab bar. Floating over the content rather than sitting at the end
+           of it, so it is in the same place whether the conversation is two
+           turns long or two hundred. -->
+      <nav class="tabbar" role="tablist" aria-label="Sections">
+        <button class="tab on" id="tab-ask" role="tab" aria-selected="true" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path
+              d="M3.75 6a2.25 2.25 0 0 1 2.25-2.25h8A2.25 2.25 0 0 1 16.25 6v4.5a2.25 2.25 0 0 1-2.25 2.25H8.5L5 15.75v-3h-.5a.75.75 0 0 1-.75-.75z"
+            />
+          </svg>
+          Ask
+        </button>
+
+        <button class="tab" id="tab-jobs" role="tab" aria-selected="false" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3 6.2l1.5 1.5L7.4 4.8M3 13.7l1.5 1.5 2.9-2.9M10.2 6.2h6.8M10.2 13.7h6.8" />
+          </svg>
+          Jobs
+          <span class="badge" id="jobs-badge" hidden>0</span>
+        </button>
+
+        <button class="tab" id="tab-history" role="tab" aria-selected="false" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <circle cx="10" cy="10" r="6.5" />
+            <path d="M10 6.2v4.1l2.7 1.6" />
+          </svg>
+          History
+        </button>
+
+        <button class="tab" id="tab-settings" role="tab" aria-selected="false" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3 6.5h3.2M11.2 6.5h5.8M3 13.5h5.8M13.8 13.5h3.2" />
+            <circle cx="8.7" cy="6.5" r="2" />
+            <circle cx="11.3" cy="13.5" r="2" />
+          </svg>
+          Settings
+        </button>
+      </nav>
     </main>
 
     <script src="./app.js" type="module"></script>

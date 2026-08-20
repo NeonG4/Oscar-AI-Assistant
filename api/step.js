@@ -27,6 +27,7 @@ import { runMissionStep, isMissionState, MAX_MISSION_STEPS } from '../lib/missio
 import { getSession } from '../lib/auth.js';
 import { applyCors, readBody, send } from '../lib/http.js';
 import { notifyAll } from '../lib/push.js';
+import { logConversation, conversationRow } from '../lib/db.js';
 import {
   loadJob,
   readJobToken,
@@ -80,6 +81,36 @@ async function announce(job, { title, body, ttl, requireInteraction }) {
   }
 }
 
+/**
+ * Write the finished job into the conversation log.
+ *
+ * Without this, background work is invisible in History — you would see every
+ * quick question you ever asked and none of the long ones, which is exactly
+ * backwards. It also carries the job's `conversation_id`, so an answer that
+ * took four minutes still lands in the thread it was asked in and a follow-up
+ * can refer back to it.
+ *
+ * Logged when the job reaches a terminal state and only then: a job that is
+ * still running has no answer to record, and one row per job is what keeps
+ * History a list of exchanges rather than a list of steps.
+ */
+async function logTurn(job, { result, error, status }) {
+  const startedAt = job.created_at ? Date.parse(job.created_at) : NaN;
+
+  await logConversation(
+    conversationRow({
+      question: job.question,
+      conversationId: job.conversation_id,
+      result,
+      error,
+      status: status || (error ? 500 : 200),
+      via: job.via,
+      source: job.source,
+      totalMs: Number.isFinite(startedAt) ? Date.now() - startedAt : null,
+    })
+  ).catch(() => {});
+}
+
 export default async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') {
@@ -90,6 +121,7 @@ export default async function handler(req, res) {
 
   const startedAt = Date.now();
   let jobId = null;
+  let job = null;
 
   try {
     const body = await readBody(req);
@@ -99,7 +131,7 @@ export default async function handler(req, res) {
     const authorised = readJobToken(body.token, process.env) === String(jobId) || Boolean(getSession(req));
     if (!authorised) return send(res, 401, { ok: false, error: 'Not authorised to advance this job.' });
 
-    const job = await loadJob(jobId);
+    job = await loadJob(jobId);
 
     // Terminal, or waiting on a human. Either way there is nothing to do, and
     // saying so plainly stops a caller from retrying in a loop.
@@ -128,7 +160,9 @@ export default async function handler(req, res) {
     // AND still checkpoint afterwards.
     while (Date.now() < deadline - CHECKPOINT_HEADROOM_MS) {
       if (steps >= ceiling) {
-        await markFailed(jobId, `Gave up after ${ceiling} steps without an answer.`);
+        const gaveUp = `Gave up after ${ceiling} steps without an answer.`;
+        await markFailed(jobId, gaveUp);
+        await logTurn(job, { error: gaveUp });
         return send(res, 200, { ok: false, status: 'failed', steps });
       }
 
@@ -140,6 +174,7 @@ export default async function handler(req, res) {
 
       if (step.status === 'done') {
         await markDone(jobId, step.result);
+        await logTurn(job, { result: step.result });
         await announce(jobId, {
           title: step.result.title || 'Oscar',
           body: step.result.answer,
@@ -190,7 +225,15 @@ export default async function handler(req, res) {
 
     // Out of budget for THIS invocation, not for the job. Checkpoint and pass
     // the baton to a fresh one.
-    await saveProgress(jobId, { state, events: state.events || [], steps });
+    await saveProgress(jobId, {
+      state,
+      events: state.events || [],
+      // Written on the job itself so the Jobs tab can show progress without
+      // loading the whole state blob, and so it survives the state being
+      // dropped when the job finishes.
+      tasks: state.tasks || [],
+      steps,
+    });
     const handedOff = continueJob(jobId);
 
     return send(res, 200, {
@@ -210,6 +253,9 @@ export default async function handler(req, res) {
     console.error('[oscar] step:', err);
     if (jobId) {
       await markFailed(jobId, message).catch(() => {});
+      // A job that broke is still a turn in the conversation, and the history
+      // is the only place it would otherwise be recorded.
+      if (job) await logTurn(job, { error: message });
       // A job that died silently is indistinguishable from one still thinking,
       // which is the worst thing to leave someone holding a phone.
       await announce(jobId, { title: 'Oscar got stuck', body: message }).catch(() => {});

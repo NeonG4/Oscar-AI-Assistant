@@ -51,6 +51,8 @@ for an answer written to fit on a lock screen.
 | `lib/missions.js`   | Work that plans itself then does itself. The plan is the memory.          |
 | `lib/questions.js`  | Things Oscar has stopped to ask you, and your answers.                   |
 | `lib/tools/questions.js` | `ask_user`: suspends the run until you reply.                        |
+| `lib/tasklist.js`   | The task list of one run: what Oscar planned, and where he has got to.   |
+| `lib/tools/checklist.js` | `plan_tasks` / `finish_task`: how that list gets made and ticked off. |
 | `api/questions.js`  | Read what's waiting, answer it, and wake the run back up.                |
 | `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
 | `lib/tools/location.js` | Where am I / where is X. GPS, IP and geocoding.                       |
@@ -74,11 +76,11 @@ for an answer written to fit on a lock screen.
 | `scripts/vapid-keys.js` | Generates the notification keypair. `npm run vapid`.                   |
 | `scripts/google-auth.js`| One-time authorisation helper. `npm run google-auth`.                  |
 | `db/schema.sql`     | The table, indexes and RLS lockdown. Paste into Supabase's SQL editor.    |
-| `public/index.html` | Login screen, ask console, and history tab.                                |
+| `public/index.html` | Login screen and the four tabs: ask, jobs, history, settings.             |
 | `public/styles.css` | All the styling.                                                          |
-| `public/app.js`     | Login flow, console logic, browser dictation for testing.                 |
+| `public/app.js`     | Login flow, the conversation, live job watching, browser dictation.       |
 | `server.js`         | Optional local dev server — plain Node, no Vercel CLI needed.             |
-| `test/smoke.js`     | 313 dependency-free tests, including the security rules. `npm test`.       |
+| `test/smoke.js`     | Dependency-free tests, including the security rules. `npm test`.           |
 | `SHORTCUT.md`       | **Step-by-step build of the iOS Shortcut.**                               |
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
@@ -156,6 +158,20 @@ Open `https://your-app.vercel.app`, enter your password, then the code from your
 email. The console behind the login calls the same endpoint your Shortcut will.
 Debug here, not on the phone.
 
+Four tabs, along the bottom:
+
+| Tab          | What it is                                                                  |
+| ------------ | --------------------------------------------------------------------------- |
+| **Ask**      | The conversation. Follow-ups carry on from the answer before them, and Oscar's thinking sits underneath — the tasks he planned, ticking off as he finishes them. |
+| **Jobs**     | Anything too heavy to answer on the end of a request, with its task list and how far through it is. Needs Supabase. |
+| **History**  | Every exchange, grouped back into the conversations they happened in. Reopen one and carry on with it. Needs Supabase. |
+| **Settings** | How much of the machinery you want to see, plus notifications and the Shortcut endpoint. |
+
+**Detailed thinking** in Settings is the one worth knowing about. On, you get
+every tool call and round as it happens; off, you get the task list alone —
+plain sentences about what Oscar is doing. The model name and the round-trip
+time can be hidden there too.
+
 ### 6. Build the Shortcut
 
 Follow **[SHORTCUT.md](./SHORTCUT.md)** — four actions, about three minutes.
@@ -179,7 +195,9 @@ at the top: an OAuth app left in "Testing" status stops working after exactly
 
 Follow **[SUPABASE.md](./SUPABASE.md)** — about ten minutes. You get a
 searchable record of every question, real cost and latency numbers, and the
-**History** tab in the console. Everything works without it.
+**History** and **Jobs** tabs in the console. Conversations need it too: the
+earlier turns of a thread are read back out of this table, which is what makes
+a follow-up question mean anything. Everything else works without it.
 
 ## Local development
 
