@@ -7,7 +7,7 @@ sitting; if something breaks you want to know which stage caused it.
 | Stage | Gets you | Time |
 | --- | --- | --- |
 | 1 | A working voice assistant on your phone | ~20 min |
-| 2 | Gmail, Calendar and Tasks | ~25 min |
+| 2 | Gmail, Calendar, Tasks, Drive and Docs | ~25 min |
 | 3 | A searchable log, plus plans | ~10 min |
 
 Tick these off as you go.
@@ -114,7 +114,7 @@ additive — stop here if you want to live with it for a day first.
 
 ---
 
-## Stage 2 — Gmail, Calendar and Tasks (~25 min)
+## Stage 2 — Gmail, Calendar, Tasks, Drive and Docs (~25 min)
 
 > **Read this before you start.** A new Google OAuth app defaults to "Testing"
 > status, and Google issues refresh tokens that **expire after 7 days** in that
@@ -195,7 +195,21 @@ Gives you the History tab, real cost numbers, and the foundation for the
       The `?deep=1` matters — it runs a real query, proving the URL, key *and*
       table all work.
 - [ ] **3.7** Ask something, then open the **History** tab.
-- [ ] **3.8** Try a plan: *"plan my move to Seattle"*, then
+
+### 3a. Let Oscar create things — REQUIRED for plans
+
+Oscar is **read-only until you switch writes on.** Without this it can read
+plans, calendar and mail but cannot create anything — and the failure is quiet,
+because the read tools still work. Ask "what are my plans?" and you get "none
+yet" rather than "I can't save plans".
+
+- [ ] Add `OSCAR_ALLOW_WRITES` = `1` in Vercel, all three environments.
+- [ ] Redeploy: `vercel --prod`
+- [ ] Check `/api/health` → `writes.enabled: true`.
+
+> This variable is also listed in GOOGLE.md, but it is **not** Google-specific.
+> It gates every write in the system, including plans.
+- [ ] **3.8** With writes on, try a plan: *"plan my move to Seattle"*, then
       *"what's next on my move plan?"*, then *"mark step 1 done"*.
       Plans need the database — that's why they're in this stage.
 

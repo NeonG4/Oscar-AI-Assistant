@@ -154,21 +154,25 @@
           <p class="meta" id="r-meta"></p>
         </section>
 
-        <section class="card recipe">
-          <h2>Shortcut recipe</h2>
-          <p class="sub">
-            The Shortcut authenticates with the <code>x-oscar-key</code> header instead of this
-            login, because Shortcuts can't read your email. Full walkthrough in
-            <code>SHORTCUT.md</code>.
+        <!-- Oscar's thinking. This is the PWA shell: when a question is
+             heavy enough to become a background job, the work streams here
+             instead of the caller waiting on an HTTP response. -->
+        <section class="card activity" aria-labelledby="activity-h">
+          <div class="activity-head">
+            <h2 id="activity-h">Oscar's thinking</h2>
+            <span class="pill" id="activity-status" data-state="idle">idle</span>
+          </div>
+
+          <ol class="log" id="activity-log" aria-live="polite"></ol>
+          <p class="empty subtle" id="activity-empty">
+            Ask something. Tool calls and progress appear here as they happen.
           </p>
-          <ol class="steps">
-            <li><b>Dictate Text</b> — Stop Listening: After Pause</li>
-            <li><b>Get Contents of URL</b> — the box below</li>
-            <li><b>Get Dictionary Value</b> — key <code>answer</code> in <i>Contents of URL</i></li>
-            <li><b>Show Notification</b> — body <i>Dictionary Value</i></li>
-          </ol>
-          <pre class="code" id="recipe"></pre>
-          <button id="copy" class="ghost" type="button">Copy endpoint URL</button>
+
+          <details class="recipe-details">
+            <summary class="meta">Shortcut endpoint</summary>
+            <pre class="code" id="recipe"></pre>
+            <button id="copy" class="ghost small" type="button">Copy endpoint URL</button>
+          </details>
         </section>
       </div>
 

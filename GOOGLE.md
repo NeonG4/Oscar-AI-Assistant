@@ -1,7 +1,7 @@
 # Connecting Google
 
-Gmail, Calendar and Tasks. About 20 minutes, most of it clicking through Google
-Cloud Console.
+Gmail, Calendar, Tasks, Drive and Docs. About 20 minutes, most of it clicking
+through Google Cloud Console.
 
 > **Read this first, or you will lose an evening.**
 >
@@ -14,6 +14,16 @@ Cloud Console.
 > starts failing with `invalid_grant`. **Set publishing status to "In
 > production"** — step 5 below. It takes one click and needs no verification for
 > personal use.
+
+> **Already connected before Drive and Docs existed?** Adding scopes does not
+> upgrade a grant you already have. Your refresh token was minted against the
+> old scope list, so Drive and Docs calls will fail with 403 until you:
+>
+> 1. enable **Google Drive API** and **Google Docs API** (step 2), then
+> 2. re-run `npm run google-auth` (step 6) and paste the new
+>    `GOOGLE_REFRESH_TOKEN` into Vercel.
+>
+> Calendar, Tasks and Gmail keep working throughout — only the two new ones 403.
 
 ---
 
@@ -30,13 +40,26 @@ Cloud Console.
 | `complete_task` | ✅ | Tick a task off |
 | `draft_email` | ✅ | Save a Gmail draft (never sends) |
 | `send_email` | ✅ | Send mail as you |
+| `search_drive` | | Find files in Drive by name |
+| `read_drive_file` | | Read a Doc, Sheet, Slides or text file's contents |
+| `read_doc` | | Read a Google Doc in full |
 | `delete_event` | ✅ | Delete a calendar event — asks first |
 | `delete_task` | ✅ | Delete a task — asks first |
 | `trash_email` | ✅ | Move mail to the bin — asks first |
+| `create_doc` | ✅ | Create a Google Doc and write content into it |
+| `append_to_doc` | ✅ | Add to the end of an existing Doc |
+| `trash_drive_file` | ✅ | Move a Drive file to the bin — asks first |
 
 **Nothing can be destroyed permanently.** `trash_email` moves a message to the
-Gmail bin, recoverable for 30 days; Gmail's permanent-delete endpoint is
-deliberately not wired up.
+Gmail bin and `trash_drive_file` moves a file to the Drive bin — both
+recoverable for 30 days. Gmail's and Drive's permanent-delete endpoints are
+deliberately not wired up. (Drive's `DELETE` skips the bin entirely, which is
+exactly what a voice assistant should never be able to do.)
+
+**Long answers become documents.** A notification is capped at a few dozen
+words, so when you ask for a workout plan, a draft letter or research notes,
+Oscar writes the substance into a Google Doc and reads you the link. That's
+what `create_doc` is for.
 
 **Destructive actions ask before acting when dictated.** Say "delete the event on
 Thursday" and Oscar replies with *Delete "Dentist" on Thursday, August 20 at 2:00
@@ -55,16 +78,19 @@ you typed it deliberately with the answer on screen. Details in
    `oscar` before continuing — enabling APIs on the wrong project is the most
    common way to waste ten minutes here.
 
-## 2. Enable the three APIs
+## 2. Enable the five APIs
 
 **APIs & Services → Library**, then search for and **Enable** each of:
 
 - **Google Calendar API**
 - **Google Tasks API**
 - **Gmail API**
+- **Google Drive API**
+- **Google Docs API**
 
 Each takes a few seconds. Miss one and that tool fails at runtime with a 403
-telling you the API is disabled.
+telling you the API is disabled. Drive and Docs are two separate APIs — enabling
+Drive does not enable Docs.
 
 ## 3. Configure the consent screen
 
@@ -123,6 +149,18 @@ It will:
 1. Ask for your client id and secret (or read them from `.env.local`).
 2. Ask whether to allow writes. Say **y** for full read/write.
 3. Open your browser.
+
+The consent screen now lists Drive and Docs alongside Calendar, Tasks and Gmail.
+Approve all of them — a partially-approved grant fails at runtime rather than at
+consent time, which is a miserable thing to debug.
+
+> **Why Drive access is broad.** Oscar requests the full `drive` scope, not
+> `drive.file`. `drive.file` only ever lets an app see files it created itself,
+> which makes "find my lease agreement" impossible — the entire reason you'd ask
+> Oscar about Drive. The tradeoff is real and worth stating plainly: this
+> refresh token can read every file in your Drive. It is mitigated the same way
+> everything else is — writes need the master switch *and* per-request
+> authority, deletes ask first, and nothing can be destroyed permanently.
 
 At the consent screen Google will say **"Google hasn't verified this app"**.
 That is expected — it's your app, and you haven't submitted it for review.
@@ -271,13 +309,19 @@ gate exists — it's the layer that still holds when the device layer doesn't.
 | Write tools never get used | Check `/api/health` → `tools.withWrite`. If it matches `readOnly`, writes are off |
 | Calendar events at the wrong time | Send `tz` from the Shortcut — see SHORTCUT.md |
 | Gmail answers feel truncated | They are. Bodies cap at 2000 characters; `bodyTruncated` flags it |
+| Drive and Docs 403 but Gmail works | Your refresh token predates those scopes. Enable both APIs, then re-run step 6 |
+| "A ... cannot be read as text" | Correct behaviour. Images, PDFs and binaries aren't readable; Oscar says so rather than inventing contents |
+| Oscar answers a long request in one sentence | The notification cap is doing its job — ask it to put the detail in a document |
 
 ---
 
 ## What's not here yet
 
-**Drive and Docs.** Deliberately deferred — this was already a large change, and
-Calendar, Tasks and Gmail are what a voice assistant actually reaches for day to
-day. Both are straightforward additions once these are proven: the OAuth layer,
-the write gate and the registry all work unchanged. Adding them means two more
-scopes, two more APIs enabled, and one re-run of `npm run google-auth`.
+**Sheets.** Reading a spreadsheet works today through `read_drive_file`, which
+exports it as CSV. Writing to one — adding a row, updating a cell — needs the
+Sheets API and its own tool, which is the obvious next addition.
+
+**Editing documents.** `append_to_doc` only adds to the end. Rewriting or
+deleting existing text means working with Docs' index ranges, which shift as you
+edit them. Deliberately deferred: an assistant that mis-edits a document you
+already wrote is worse than one that can only add.

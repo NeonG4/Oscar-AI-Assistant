@@ -69,7 +69,7 @@ for an answer written to fit on a lock screen.
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
 | `TOOLS.md`          | **How the tools work, and how to add your own.**                          |
-| `GOOGLE.md`         | **Connecting Gmail, Calendar and Tasks.** Includes the 7-day OAuth trap.  |
+| `GOOGLE.md`         | **Connecting Gmail, Calendar, Tasks, Drive and Docs.** Includes the 7-day OAuth trap. |
 
 ## Setup
 
@@ -151,7 +151,8 @@ Location** step to your Shortcut so it knows where you are; see
 
 ### 8. Optional: connect Google
 
-Gmail, Calendar and Tasks — "what's on my calendar?", "any mail from Sam?",
+Gmail, Calendar, Tasks, Drive and Docs — "what's on my calendar?", "any mail
+from Sam?", "find my lease agreement", "write that up as a doc",
 "add milk to my list". Follow **[GOOGLE.md](./GOOGLE.md)**, and read the warning
 at the top: an OAuth app left in "Testing" status stops working after exactly
 7 days.

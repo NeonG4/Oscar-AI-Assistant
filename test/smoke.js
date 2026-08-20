@@ -71,6 +71,14 @@ import {
   searchEmailTool,
   sendEmailTool,
 } from '../lib/tools/gmail.js';
+import { searchDriveTool, readDriveFileTool, trashDriveFileTool } from '../lib/tools/drive.js';
+import {
+  createDocTool,
+  readDocTool,
+  appendToDocTool,
+  extractDocText,
+  endIndexOf,
+} from '../lib/tools/docs.js';
 import {
   createConfirmToken,
   readConfirmToken,
@@ -1592,6 +1600,43 @@ function fakeGoogle(overrides = {}) {
         payload: { headers: [{ name: 'From', value: 'Jane <jane@example.com>' }, { name: 'Subject', value: 'Lunch?' }, { name: 'Date', value: 'Mon, 17 Aug 2026 09:00:00 -0700' }],
           mimeType: 'text/plain', body: { data: Buffer.from('Are you free for lunch?').toString('base64url') } } });
     }
+    if (href.includes('/drive/v3/files')) {
+      // Drive hands back raw bytes for downloads and exports, not JSON.
+      const raw = (body) => ({ ok: true, status: 200, text: async () => body });
+      if (init.method === 'PATCH') return json({ id: 'f1', name: 'Lease agreement', trashed: true });
+      if (href.includes('/export')) return raw('Exported document text.\n');
+      if (href.includes('alt=media')) return raw('plain text file contents');
+      // /files/<id> is one file; /files?... is the collection.
+      const oneFile = /\/files\/([^/?]+)(\?|$)/.exec(href);
+      if (oneFile) {
+        return json({
+          id: oneFile[1],
+          name: 'Lease agreement',
+          mimeType: overrides.driveMime || 'application/vnd.google-apps.document',
+          webViewLink: 'https://drive.google.com/file/d/' + oneFile[1],
+        });
+      }
+      return json({ files: [
+        { id: 'f1', name: 'Lease agreement', mimeType: 'application/vnd.google-apps.document',
+          modifiedTime: '2026-08-01T10:00:00.000Z', webViewLink: 'https://docs.google.com/document/d/f1/edit',
+          owners: [{ displayName: 'David' }] },
+        { id: 'f2', name: 'Budget 2026', mimeType: 'application/vnd.google-apps.spreadsheet',
+          modifiedTime: '2026-07-30T10:00:00.000Z' },
+        { id: 'f3', name: 'Scan.png', mimeType: 'image/png', modifiedTime: '2026-07-01T10:00:00.000Z' },
+      ] });
+    }
+    if (href.includes('docs.googleapis.com')) {
+      if (href.includes(':batchUpdate')) return json({ documentId: 'doc1', replies: [{}] });
+      if (init.method === 'POST') return json({ documentId: 'doc1', title: JSON.parse(init.body).title });
+      return json({ documentId: 'doc1', title: 'Running notes', body: { content: [
+        { endIndex: 1 },
+        { paragraph: { elements: [{ textRun: { content: 'First line\n' } }] } },
+        { table: { tableRows: [{ tableCells: [{ content: [
+          { paragraph: { elements: [{ textRun: { content: 'in a table\n' } }] } },
+        ] }] }] } },
+        { paragraph: { elements: [{ textRun: { content: 'Last line\n' } }] }, endIndex: 42 },
+      ] } });
+    }
     throw new Error(`unexpected google url: ${href}`);
   };
   fn.calls = calls;
@@ -1820,6 +1865,172 @@ await test('searching email returns headers without bodies', async () => {
 });
 
 /* ========================================================== the write gate */
+/* ================================================================== drive */
+section('drive tool');
+
+await test('a file name with a quote in it cannot break the query', async () => {
+  const fetchImpl = fakeGoogle();
+  await searchDriveTool.run({ query: "Dave's C:\\notes" }, { env: G_ENV, fetchImpl });
+  const q = new URL(fetchImpl.calls.find((c) => c.href.includes('/drive/v3/files')).href)
+    .searchParams.get('q');
+  // Drive's query language is single-quote delimited with backslash escaping.
+  // An unescaped apostrophe would terminate the literal and change the search.
+  assert.ok(q.includes("name contains 'Dave\\'s C:\\\\notes'"), q);
+  assert.ok(q.includes('trashed = false'), 'binned files must stay out of results');
+});
+
+await test('search_drive narrows by kind and names types in plain language', async () => {
+  const fetchImpl = fakeGoogle();
+  const out = await searchDriveTool.run({ type: 'document', limit: 3 }, { env: G_ENV, fetchImpl });
+  const url = new URL(fetchImpl.calls.find((c) => c.href.includes('/drive/v3/files')).href);
+  assert.ok(url.searchParams.get('q').includes("mimeType = 'application/vnd.google-apps.document'"));
+  assert.equal(url.searchParams.get('pageSize'), '3');
+  assert.equal(out.files[0].type, 'Google Doc', 'raw mime types are useless in a spoken answer');
+  assert.equal(out.files[1].type, 'Google Sheet');
+  assert.equal(out.files[0].modified, '2026-08-01', 'the time part is noise');
+});
+
+await test('search_drive says so when nothing matches', async () => {
+  const empty = fakeGoogle();
+  const fetchImpl = async (url, init) =>
+    String(url).includes('/drive/v3/files')
+      ? { ok: true, status: 200, text: async () => JSON.stringify({ files: [] }) }
+      : empty(url, init);
+  const out = await searchDriveTool.run({ query: 'nope' }, { env: G_ENV, fetchImpl });
+  assert.equal(out.count, 0);
+  assert.match(out.note, /Nothing/, 'an empty list should read as an answer, not a failure');
+});
+
+await test('google-native files are exported, ordinary ones downloaded', async () => {
+  const asDoc = fakeGoogle();
+  const doc = await readDriveFileTool.run({ id: 'f1' }, { env: G_ENV, fetchImpl: asDoc });
+  assert.equal(doc.readable, true);
+  assert.equal(doc.content, 'Exported document text.');
+  const exported = asDoc.calls.find((c) => c.href.includes('/export'));
+  assert.ok(exported, 'a Google Doc must go through /export, not alt=media');
+  assert.ok(exported.href.includes(encodeURIComponent('text/plain')));
+
+  const asText = fakeGoogle({ driveMime: 'text/markdown' });
+  const txt = await readDriveFileTool.run({ id: 'f9' }, { env: G_ENV, fetchImpl: asText });
+  assert.equal(txt.content, 'plain text file contents');
+  assert.ok(asText.calls.some((c) => c.href.includes('alt=media')));
+  assert.ok(!asText.calls.some((c) => c.href.includes('/export')));
+});
+
+await test('a binary file reports that it cannot be read rather than guessing', async () => {
+  const fetchImpl = fakeGoogle({ driveMime: 'image/png' });
+  const out = await readDriveFileTool.run({ id: 'f3' }, { env: G_ENV, fetchImpl });
+  assert.equal(out.readable, false);
+  assert.match(out.note, /image/);
+  assert.equal(out.content, undefined, 'there must be nothing here for the model to invent from');
+  assert.ok(!fetchImpl.calls.some((c) => c.href.includes('alt=media')), 'do not download bytes we cannot use');
+});
+
+await test('trashing a drive file bins it and never issues DELETE', async () => {
+  const fetchImpl = fakeGoogle();
+  const out = await trashDriveFileTool.run({ id: 'f1' }, { env: G_ENV, fetchImpl });
+  assert.equal(out.trashed, true);
+
+  const patch = fetchImpl.calls.find((c) => c.method === 'PATCH');
+  assert.ok(patch, 'the bin is a PATCH of trashed=true');
+  assert.deepEqual(patch.body, { trashed: true });
+  // Drive's DELETE skips the bin and is irreversible. Nothing here may use it.
+  assert.ok(!fetchImpl.calls.some((c) => c.method === 'DELETE'), 'DELETE is permanent — never');
+  assert.match(out.confirmation, /30 days/);
+});
+
+await test('trash_drive_file asks about the file by name, not by id', async () => {
+  assert.equal(trashDriveFileTool.confirm, true);
+  assert.equal(trashDriveFileTool.writes, true);
+  const prompt = await trashDriveFileTool.describe({ id: 'f1' }, { env: G_ENV, fetchImpl: fakeGoogle() });
+  assert.match(prompt, /Lease agreement/);
+  assert.ok(!prompt.includes('f1'), 'an id means nothing to someone being asked to confirm');
+});
+
+/* =================================================================== docs */
+section('docs tool');
+
+await test('document text is walked out of the tree, tables included', () => {
+  const doc = { body: { content: [
+    { paragraph: { elements: [{ textRun: { content: 'Title\n' } }] } },
+    { table: { tableRows: [{ tableCells: [{ content: [
+      { paragraph: { elements: [{ textRun: { content: 'cell text\n' } }] } },
+    ] }] }] } },
+    { tableOfContents: { content: [
+      { paragraph: { elements: [{ textRun: { content: 'contents\n' } }] } },
+    ] } },
+    { sectionBreak: {} },
+  ] } };
+  const text = extractDocText(doc);
+  assert.match(text, /Title/);
+  assert.match(text, /cell text/, 'text inside tables is still text');
+  assert.match(text, /contents/);
+  assert.equal(extractDocText(null), '', 'a missing document is empty, not a crash');
+});
+
+await test('extractDocText collapses runs of blank lines', () => {
+  const doc = { body: { content: [
+    { paragraph: { elements: [{ textRun: { content: 'a\n\n\n\n\nb\n' } }] } },
+  ] } };
+  assert.equal(extractDocText(doc), 'a\n\nb');
+});
+
+await test('the insert point backs off the document final newline', () => {
+  // Docs rejects an insertion at or past the body's end index, because that
+  // last newline is a real character owned by the document.
+  assert.equal(endIndexOf({ body: { content: [{ endIndex: 42 }] } }), 41);
+  assert.equal(endIndexOf({ body: { content: [{ endIndex: 1 }] } }), 1, 'never below 1');
+  assert.equal(endIndexOf({}), 1);
+  assert.equal(endIndexOf(null), 1);
+});
+
+await test('create_doc writes the content in, not just the title', async () => {
+  const fetchImpl = fakeGoogle();
+  const out = await createDocTool.run({ title: 'Workout plan', content: 'Day one.\n\nDay two.' },
+    { env: G_ENV, fetchImpl });
+  assert.equal(out.created, true);
+  assert.equal(out.id, 'doc1');
+  assert.match(out.link, /docs\.google\.com\/document\/d\/doc1/);
+  assert.equal(out.words, 4);
+
+  const update = fetchImpl.calls.find((c) => c.href.includes(':batchUpdate'));
+  assert.ok(update, 'a document created empty is a document that never got written');
+  const insert = update.body.requests[0].insertText;
+  assert.equal(insert.location.index, 1, 'index 1 is the only valid point in an empty document');
+  assert.match(insert.text, /Day two/);
+});
+
+await test('create_doc refuses a document with no title', async () => {
+  await assert.rejects(() => createDocTool.run({ title: '   ', content: 'x' },
+    { env: G_ENV, fetchImpl: fakeGoogle() }), /title/);
+});
+
+await test('append lands at endIndex - 1 and separates itself from what is there', async () => {
+  const fetchImpl = fakeGoogle();
+  const out = await appendToDocTool.run({ id: 'doc1', text: 'Another entry.' }, { env: G_ENV, fetchImpl });
+  assert.equal(out.appended, true);
+  assert.equal(out.title, 'Running notes');
+
+  const insert = fetchImpl.calls.find((c) => c.href.includes(':batchUpdate')).body.requests[0].insertText;
+  assert.equal(insert.location.index, 41, 'the fake document ends at 42');
+  assert.equal(insert.text, '\nAnother entry.', 'without the newline it runs into the previous line');
+});
+
+await test('append_to_doc refuses to append nothing', async () => {
+  await assert.rejects(() => appendToDocTool.run({ id: 'doc1', text: '   ' },
+    { env: G_ENV, fetchImpl: fakeGoogle() }), /nothing/i);
+});
+
+await test('read_doc returns text, not the document tree', async () => {
+  const out = await readDocTool.run({ id: 'doc1' }, { env: G_ENV, fetchImpl: fakeGoogle() });
+  assert.equal(out.title, 'Running notes');
+  assert.equal(out.truncated, false);
+  assert.match(out.content, /First line/);
+  assert.match(out.content, /in a table/);
+  assert.equal(out.words, 7, 'the table cell counts too');
+  assert.ok(!('body' in out), 'the model must never see raw Docs JSON');
+});
+
 section('write gate');
 
 await test('write tools are hidden without permission', () => {
@@ -1827,11 +2038,13 @@ await test('write tools are hidden without permission', () => {
   const readOnly = availableTools({ canWrite: false }, env).map((t) => t.name);
   const withWrite = availableTools({ canWrite: true }, env).map((t) => t.name);
 
-  for (const name of ['send_email', 'draft_email', 'create_event', 'create_task', 'complete_task']) {
+  for (const name of ['send_email', 'draft_email', 'create_event', 'create_task', 'complete_task',
+    'create_doc', 'append_to_doc', 'trash_drive_file']) {
     assert.ok(!readOnly.includes(name), `${name} must be hidden from a read-only request`);
     assert.ok(withWrite.includes(name), `${name} should appear with write permission`);
   }
-  for (const name of ['search_email', 'list_events', 'list_tasks', 'get_weather']) {
+  for (const name of ['search_email', 'list_events', 'list_tasks', 'get_weather',
+    'search_drive', 'read_drive_file', 'read_doc']) {
     assert.ok(readOnly.includes(name), `${name} should always be available`);
   }
 });

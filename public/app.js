@@ -58,6 +58,8 @@ const el = {
   answer: $('r-answer'),
   detail: $('r-detail'),
   meta: $('r-meta'),
+  activityStatus: $('activity-status'),
+  activityLog: $('activity-log'),
   recipe: $('recipe'),
   copy: $('copy'),
   endpoint: $('endpoint'),
@@ -349,6 +351,11 @@ async function ask() {
   el.send.textContent = 'Thinking…';
   render({ ok: true, title: 'Working…', answer: question, meta: '' });
 
+  stopWatching();
+  clearLog();
+  setActivity('working', 'thinking');
+  logLine(question, { kind: 'note' });
+
   const started = performance.now();
 
   try {
@@ -381,6 +388,21 @@ async function ask() {
 
     // render() clears any previous confirmation, so this has to come after it.
     if (data.needsConfirmation) showConfirm(data);
+
+    if (data.async && data.jobId) {
+      // Heavy work. The server is already running it; follow along.
+      logLine('handed off to a background job', {
+        kind: 'note',
+        how: `${data.mode} · routed by ${data.routedBy}`,
+      });
+      watchJob(data.jobId, data.jobToken);
+    } else {
+      for (const name of data.tools || []) logLine(name, { how: 'tool' });
+      setActivity(data.ok ? 'done' : 'bad', data.ok ? `done · ${data.rounds || 1} rounds` : 'failed');
+      if (data.mode) {
+        logLine(`answered inline`, { kind: 'note', how: `${data.mode} · ${data.model || ''}`.trim() });
+      }
+    }
   } catch (err) {
     render({ ok: false, title: 'Network error', answer: String((err && err.message) || err) });
   } finally {
@@ -389,6 +411,156 @@ async function ask() {
     el.send.disabled = false;
     el.send.textContent = 'Ask Oscar';
   }
+}
+
+/* ================================================== Oscar's thinking */
+
+/**
+ * The shell. When a question is heavy enough to become a background job, the
+ * work is NOT held open on an HTTP connection — it runs server-side across as
+ * many invocations as it needs, and this panel watches it.
+ *
+ * Everything is mirrored to console.log too, so the browser devtools give you
+ * the same trace without the UI.
+ */
+
+let pollTimer = null;
+let watchingJob = null;
+
+function setActivity(state, label) {
+  el.activityStatus.dataset.state = state;
+  el.activityStatus.textContent = label;
+}
+
+function clearLog() {
+  el.activityLog.replaceChildren();
+}
+
+/**
+ * Built with createElement, not innerHTML: tool names and error text come from
+ * the server, and textContent cannot be tricked into executing markup.
+ */
+function logLine(what, { kind = '', how = '' } = {}) {
+  const li = document.createElement('li');
+  if (kind) li.className = kind;
+
+  const tick = document.createElement('span');
+  tick.className = 'tick';
+  tick.textContent = new Date().toLocaleTimeString(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).replace(/^(\d)/, '0$1').slice(-8);
+
+  const body = document.createElement('span');
+  body.className = 'what';
+  body.textContent = what;
+
+  const note = document.createElement('span');
+  note.className = 'how';
+  note.textContent = how;
+
+  li.append(tick, body, note);
+  el.activityLog.appendChild(li);
+  el.activityLog.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  console.log(`[oscar] ${what}${how ? ` — ${how}` : ''}`);
+  return li;
+}
+
+function stopWatching() {
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  watchingJob = null;
+}
+
+/** Render tool events we have not already shown. */
+function renderEvents(events, alreadyShown) {
+  let shown = alreadyShown;
+  for (let i = alreadyShown; i < events.length; i++) {
+    const e = events[i];
+    logLine(e.ok ? `${e.tool}` : `${e.tool} failed`, {
+      kind: e.ok ? '' : 'bad',
+      how: e.ok ? `round ${e.round}` : e.detail || '',
+    });
+    shown = i + 1;
+  }
+  return shown;
+}
+
+/**
+ * Poll a background job until it finishes.
+ *
+ * Polling rather than a socket on purpose: it survives the tab being
+ * backgrounded, reconnects for free, and needs no server-side connection state.
+ * Each poll also nudges the job along if its self-continuation was ever lost —
+ * which is why a dropped hop is recoverable rather than fatal.
+ */
+async function watchJob(jobId, token) {
+  stopWatching();
+  watchingJob = jobId;
+
+  let shown = 0;
+  const startedAt = Date.now();
+  const GIVE_UP_AFTER = 5 * 60 * 1000;
+
+  const tick = async () => {
+    if (watchingJob !== jobId) return;
+
+    try {
+      const query = new URLSearchParams({ id: jobId });
+      if (token) query.set('token', token);
+      const { data } = await api(`/api/jobs?${query}`);
+      const job = data.job;
+      if (!job) throw new Error(data.error || 'Job not found.');
+
+      shown = renderEvents(job.events || [], shown);
+
+      if (job.status === 'done') {
+        setActivity('done', `done · ${job.steps} steps`);
+        logLine('finished', { kind: 'note', how: `${job.steps} steps` });
+        render({
+          ok: true,
+          title: job.title || 'Done',
+          answer: job.answer || '',
+          detail: job.detail,
+          meta: `${job.model || 'model'} · ${job.steps} steps · background job`,
+        });
+        historyLoaded = false;
+        return stopWatching();
+      }
+
+      if (job.status === 'awaiting_confirm') {
+        setActivity('working', 'waiting on you');
+        logLine('needs your confirmation', { kind: 'note' });
+        render({ ok: true, title: job.title || 'Confirm', answer: job.answer || '' });
+        if (job.pendingConfirmation) {
+          showConfirm({ confirmToken: null, confirmExpiresInSeconds: 300 });
+        }
+        return stopWatching();
+      }
+
+      if (job.status === 'failed') {
+        setActivity('bad', 'failed');
+        logLine(job.error || 'failed', { kind: 'bad' });
+        render({ ok: false, title: 'Oscar failed', answer: job.error || 'The job failed.' });
+        return stopWatching();
+      }
+
+      setActivity('working', `${job.status} · ${job.steps} steps`);
+
+      if (Date.now() - startedAt > GIVE_UP_AFTER) {
+        setActivity('bad', 'gave up watching');
+        logLine('stopped watching after five minutes — the job may still finish', { kind: 'note' });
+        return stopWatching();
+      }
+
+      pollTimer = setTimeout(tick, 1200);
+    } catch (err) {
+      logLine(String((err && err.message) || err), { kind: 'bad' });
+      setActivity('bad', 'lost the job');
+      stopWatching();
+    }
+  };
+
+  tick();
 }
 
 /* ====================================================== confirmations */

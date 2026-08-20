@@ -66,6 +66,20 @@ export default async function handler(req, res) {
           webDictated: true,
           alsoConfirmsSending: env.OSCAR_CONFIRM_SEND === '1',
         },
+        // Surfaced at the top level because a missing OSCAR_ALLOW_WRITES is
+        // silent otherwise: read tools work, write tools are simply absent, and
+        // the model says "no plans yet" rather than "I can't save plans".
+        writes: {
+          enabled: env.OSCAR_ALLOW_WRITES === '1',
+          proof: env.OSCAR_WRITE_SECRET ? 'session or x-oscar-write' : 'session only',
+          ...(env.OSCAR_ALLOW_WRITES === '1'
+            ? {}
+            : {
+                hint:
+                  'Set OSCAR_ALLOW_WRITES=1 and redeploy. Without it Oscar can read plans, ' +
+                  'calendar and mail but cannot create anything.',
+              }),
+        },
         routing: {
           enabled: isRoutingEnabled(env),
           ...routerModels(env),

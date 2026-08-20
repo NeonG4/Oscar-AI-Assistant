@@ -9,6 +9,8 @@ Oscar can call out for live data and act on your behalf, instead of guessing.
 | `lib/tools/calendar.js` | `list_events`, `create_event`, `delete_event` |
 | `lib/tools/tasks.js` | `list_tasks`, `create_task`, `complete_task`, `delete_task` |
 | `lib/tools/gmail.js` | `search_email`, `read_email`, `draft_email`, `send_email`, `trash_email` |
+| `lib/tools/drive.js` | `search_drive`, `read_drive_file`, `trash_drive_file` |
+| `lib/tools/docs.js` | `create_doc`, `read_doc`, `append_to_doc` |
 | `lib/tools/plans.js` | `create_plan`, `list_plans`, `get_plan`, `add_plan_steps`, `complete_plan_step`, `update_plan`, `delete_plan` |
 
 The Google ones need [GOOGLE.md](./GOOGLE.md) set up first, and the plan ones
@@ -237,6 +239,10 @@ than a read-modify-write of the whole plan.
 silently. Accepting a plan and quietly dropping it would be far worse than
 saying "I can't store plans". `/api/health` reports `plans.available`.
 
+**Nothing is saved until `OSCAR_ALLOW_WRITES=1`.** Without it `create_plan` is
+never offered to the model, so "what are my plans?" answers "none yet" and no
+error appears anywhere. Check `/api/health` → `writes.enabled`.
+
 **Reading is free, changing needs write permission.** `list_plans` and
 `get_plan` work from the read-only Shortcut; everything else needs write
 authority. `delete_plan` also asks for confirmation when dictated.
@@ -260,12 +266,15 @@ There's no permanent-loss path that doesn't ask first.
 
 ## Destructive actions
 
-Three tools can remove things: `delete_event`, `delete_task` and `trash_email`.
-Two properties apply to all of them.
+Four tools can remove things: `delete_event`, `delete_task`, `trash_email` and
+`trash_drive_file`. Two properties apply to all of them.
 
 **Nothing is destroyed permanently.** `trash_email` calls Gmail's `/trash`, not
-its permanent delete — the message sits in the bin for 30 days. Gmail's
-irrecoverable delete endpoint is deliberately not wired up at all.
+its permanent delete, and `trash_drive_file` PATCHes `trashed: true` rather than
+issuing Drive's `DELETE` — both leave the item in a bin for 30 days. The
+irrecoverable endpoints of both APIs are deliberately not wired up at all. This
+matters more in Drive than in Gmail: Drive's `DELETE` doesn't bin a file, it
+destroys it, with no undo anywhere in the product.
 
 **They ask first, on the routes where asking matters.** A tool marked
 `confirm: true` doesn't act on the first call. It runs a read-only `describe()`
@@ -314,6 +323,23 @@ naming the target. `describe` must be read-only — it runs before the user has
 agreed to anything.
 
 ---
+
+## When the answer is too long to say
+
+A notification is capped at `OSCAR_MAX_WORDS` (60 by default), which is the
+right size for "18°C and clearing up" and hopeless for a workout plan. The
+resolution is not a longer notification — it's `create_doc`.
+
+Ask for something substantial and Oscar writes the real content into a Google
+Doc, then tells you it's ready and hands you the link. The spoken answer stays
+short because the substance went somewhere that can hold it. The system prompt
+pushes for this explicitly, because the failure mode otherwise is a model
+compressing a plan into three useless sentences.
+
+`append_to_doc` covers the running-notes case — a journal, a log, a list you add
+to over weeks — without creating a new document every time. It only appends; it
+cannot edit or delete what's already in a document you wrote. That's a
+deliberate limit, not a missing feature.
 
 ## Adding your own tool
 

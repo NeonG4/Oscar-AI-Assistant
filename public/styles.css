@@ -615,3 +615,121 @@ code {
     background: #dc2626;
   }
 }
+
+/* ---------- activity log: Oscar thinking out loud ---------- */
+
+.activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.activity-head h2 {
+  margin: 0;
+}
+
+.pill[data-state="idle"] {
+  color: var(--muted);
+}
+
+.pill[data-state="working"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.pill[data-state="working"]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 6px;
+  vertical-align: 1px;
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.pill[data-state="done"] {
+  color: var(--good);
+  border-color: color-mix(in srgb, var(--good) 40%, transparent);
+}
+
+.log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0;
+  font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.log:empty {
+  display: none;
+}
+
+.log li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.log li:last-child {
+  border-bottom: 0;
+}
+
+.log .tick {
+  color: var(--muted);
+  font-size: 11px;
+  min-width: 2.5em;
+}
+
+.log .what {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.log .how {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.log li.bad .what {
+  color: var(--bad);
+}
+
+.log li.note .what {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.subtle {
+  border: 0;
+  padding: 14px 0;
+  text-align: left;
+}
+
+.log:not(:empty) + .subtle {
+  display: none;
+}
+
+.recipe-details summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.recipe-details[open] summary {
+  margin-bottom: 8px;
+}
+
+.recipe-details > *:not(summary) {
+  margin-top: 8px;
+}
+
+.small {
+  padding: 6px 12px;
+  font-size: 13px;
+}

@@ -633,9 +633,29 @@ city.
 
 ---
 
+## `OSCAR_ALLOW_WRITES` — required to create anything
+
+**Default:** unset, which means **read-only**.
+
+The master switch for every tool that changes something: creating plans,
+calendar events and tasks, drafting and sending mail. Set it to `1` and
+redeploy.
+
+**Why this catches people out:** without it, read tools still work perfectly.
+Ask "what are my plans?" and Oscar answers "none yet" — because `list_plans` is
+available and `create_plan` was never offered to it. Nothing errors; plans just
+never get made.
+
+`/api/health` reports `writes.enabled` so you can check at a glance.
+
+It is documented in GOOGLE.md too, but it is **not** Google-specific — it gates
+plans just as much as email.
+
+---
+
 ## Google variables
 
-For Gmail, Calendar and Tasks. All optional — Oscar works without them. The full
+For Gmail, Calendar, Tasks, Drive and Docs. All optional — Oscar works without them. The full
 walkthrough, including the OAuth trap that breaks things after a week, is in
 **[GOOGLE.md](./GOOGLE.md)**.
 
