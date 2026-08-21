@@ -23,7 +23,13 @@
  */
 
 import { runAgentStep, AgentError } from '../lib/agent.js';
-import { runMissionStep, isMissionState, MAX_MISSION_STEPS } from '../lib/missions.js';
+import {
+  runMissionStep,
+  isMissionState,
+  missionSummary,
+  closeMissionPlan,
+  MAX_MISSION_STEPS,
+} from '../lib/missions.js';
 import { getSession } from '../lib/auth.js';
 import { applyCors, readBody, send } from '../lib/http.js';
 import { notifyAll } from '../lib/push.js';
@@ -67,6 +73,18 @@ const CHECKPOINT_HEADROOM_MS = 8000;
  * the job stops dead with nothing left to restart it.
  */
 const MIN_ROUND_RUNWAY_MS = 12000;
+
+/**
+ * How many times a job may hand a round on because the provider pushed back.
+ *
+ * lib/backoff.js already waits as long as ONE invocation can afford. When that
+ * is not enough, the round is worth passing to a fresh invocation with a fresh
+ * budget rather than failing a job that may be twenty steps deep. Bounded,
+ * because a provider that is properly down stays down, and an unbounded version
+ * of this is a job that hops forever. Reset the moment a round succeeds, so a
+ * long mission is not killed by five unlucky minutes spread over an hour.
+ */
+const MAX_STALLED_HANDOFFS = 5;
 
 // Exported for the test that checks these three still fit inside the
 // maxDuration vercel.json hands the function. Nothing else reads them.
@@ -148,6 +166,10 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   let jobId = null;
   let job = null;
+  // Hoisted out of the loop so the failure path below can still see how far the
+  // run got. Reporting a plain failure over work that actually happened is the
+  // one thing worse than the failure itself.
+  let state = null;
 
   try {
     const body = await readBody(req);
@@ -188,8 +210,9 @@ export default async function handler(req, res) {
     // whose baton was lost.
     await markRunning(jobId);
 
-    let state = job.state;
+    state = job.state;
     let steps = job.steps || 0;
+    let stalls = Number(state.stalls) || 0;
     const deadline = startedAt + INVOCATION_BUDGET_MS;
 
     // A mission plans and then works its own task list, so it gets a far
@@ -219,30 +242,56 @@ export default async function handler(req, res) {
           ? await runMissionStep(state, { env: process.env, deadline, timeoutMs })
           : await runAgentStep(state, { env: process.env, deadline, timeoutMs });
       } catch (err) {
-        // A model call cut short because THIS invocation was running out is not
-        // a failed job. `state` is still what it was before the round, and no
-        // tool has run yet at that point, so the round simply happens again in
-        // the next invocation with a full budget to do it in.
-        //
-        // A rate limit that swallowed the rest of the invocation is the same
-        // situation wearing a different status code. lib/backoff.js has already
-        // waited as long as this invocation could afford; running out while
-        // waiting means the next invocation should carry the round, not that
-        // the job failed. The clock check is what makes that safe — a 429 that
-        // came back instantly (no quota, bad billing) is nowhere near the
-        // deadline, so it still throws instead of handing off forever.
-        if (
+        // The provider was busy, slow or briefly broken — not a request that
+        // was wrong and will be wrong again. `state` is still what it was
+        // before the round and no tool has run yet at that point, so the round
+        // can simply happen again. A 429 that means "no quota left" is excluded
+        // by hand: it is the one that will say the same thing in an hour.
+        const retryable =
           err instanceof AgentError &&
-          (err.status === 504 || err.status === 429) &&
-          Date.now() >= deadline - CHECKPOINT_HEADROOM_MS
-        ) {
-          break;
+          err.permanent !== true &&
+          (err.status === 504 || err.status === 502 || err.status === 429);
+
+        // Cut short because THIS invocation was running out. Fall out of the
+        // loop and let the ordinary handoff below carry the round on.
+        if (retryable && Date.now() >= deadline - CHECKPOINT_HEADROOM_MS) break;
+
+        // Same round, different reason: lib/backoff.js waited as long as this
+        // invocation could afford and the provider still said no. Failing here
+        // would throw away a mission that may be twenty steps deep over a few
+        // busy minutes, so the round is handed to a fresh invocation instead.
+        // Bounded by MAX_STALLED_HANDOFFS so a provider that is genuinely down
+        // ends the job rather than being retried forever.
+        if (retryable && stalls < MAX_STALLED_HANDOFFS) {
+          stalls += 1;
+          console.error(`[oscar] job ${jobId} stalled (${err.message}) — handoff ${stalls}`);
+          state = { ...state, stalls };
+          await saveProgress(jobId, {
+            state,
+            events: state.events || [],
+            tasks: state.tasks || [],
+            steps,
+          });
+          const passed = await continueJob(jobId);
+          return send(res, 200, {
+            ok: true,
+            status: 'running',
+            steps,
+            continued: passed,
+            stalled: err.message,
+          });
         }
+
         throw err;
       }
 
       state = step.state;
       steps += 1;
+      // The round landed, so whatever the provider was doing earlier is over.
+      if (stalls || state.stalls) {
+        stalls = 0;
+        state = { ...state, stalls: 0 };
+      }
 
       if (step.status === 'done') {
         // 'done' is the agent's word for "this round produced an answer", which
@@ -338,6 +387,33 @@ export default async function handler(req, res) {
         : 'Something broke while running the job.';
     console.error('[oscar] step:', err);
     if (jobId) {
+      // A mission that got real work done is not a failure, whatever broke at
+      // the end of it. The document it wrote is sitting in Drive either way,
+      // and the run most likely to be cut short is the wrap-up — the last one,
+      // after an hour of hammering the provider, whose only job was to describe
+      // things that already exist. So the mission reports itself from its own
+      // notes and artifacts instead, honestly marked as stopped early when it
+      // did not finish the list.
+      const salvaged =
+        isMissionState(state) && (state.tasksDone > 0 || (state.artifacts || []).length > 0)
+          ? missionSummary(state, { error: message })
+          : null;
+
+      if (salvaged) {
+        await markDone(jobId, salvaged).catch(() => {});
+        // It is not going to be worked any further, so it should stop showing
+        // up as active work alongside the user's own plans.
+        await closeMissionPlan(state).catch(() => {});
+        if (job) await logTurn(job, { result: salvaged });
+        await announce(jobId, { title: salvaged.title, body: salvaged.answer }).catch(() => {});
+        return send(res, 200, {
+          ok: true,
+          status: salvaged.incomplete ? 'incomplete' : 'done',
+          answer: salvaged.answer,
+          error: message,
+        });
+      }
+
       await markFailed(jobId, message).catch(() => {});
       // A job that broke is still a turn in the conversation, and the history
       // is the only place it would otherwise be recorded.

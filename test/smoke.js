@@ -160,6 +160,7 @@ import {
   isMissionAwaitingAnswer,
   resumeMissionWithAnswer,
   runMissionStep,
+  missionSummary,
   MAX_MISSION_STEPS,
 } from '../lib/missions.js';
 import questionsHandler from '../api/questions.js';
@@ -4857,6 +4858,167 @@ await test('the mission ceiling is far above a job\'s, and still finite', () => 
   assert.ok(MAX_MISSION_STEPS <= 1000);
 });
 
+section('one thing, one step');
+
+/** A mission world that can also reach Google, for steps that make documents. */
+function missionWorldWithDocs(turns) {
+  const world = missionWorld(turns);
+  const google = fakeGoogle();
+  const fn = async (url, init) =>
+    String(url).includes('googleapis.com') ? google(url, init) : world(url, init);
+  fn.db = world.db;
+  fn.prompts = world.prompts;
+  fn.google = google;
+  return fn;
+}
+
+const CREATE_DOC = {
+  role: 'assistant',
+  content: null,
+  tool_calls: [
+    {
+      id: 'call_doc',
+      type: 'function',
+      function: {
+        name: 'create_doc',
+        arguments: JSON.stringify({ title: 'Flower and Tomato', content: 'Once upon a time.' }),
+      },
+    },
+  ],
+};
+
+await test('the planner is told to keep one thing to one step', async () => {
+  const world = missionWorld([PLAN_CALL, say('Planned', 'Saved it.')]);
+  const state = createMissionState({ question: 'write me a story', canWrite: true }, MISSION_ENV);
+  await runMissionStep(state, { env: MISSION_ENV, fetchImpl: world });
+
+  const planning = world.prompts[0];
+  assert.match(planning, /ONE STEP OWNS ONE THING/);
+  assert.match(planning, /1 to 6/, 'as few steps as the goal needs, not a minimum of three');
+  assert.ok(!/3 to 8/.test(planning), 'the old floor is what padded four steps out of one');
+});
+
+await test('a document one step made is handed to the next, not made twice', async () => {
+  // The exact shape of the bug: step 1 writes the story into a document, step 2
+  // is told to "save it to a document" and, starting fresh, makes another one.
+  const env = { ...MISSION_ENV, ...G_ENV };
+  const world = missionWorldWithDocs([
+    PLAN_CALL,
+    say('Planned', 'Saved the list.'),
+    CREATE_DOC,
+    say('Written', 'Wrote the story into a document.'),
+    say('Checked', 'Nothing else needed.'),
+    say('Done', 'It is in the document.'),
+  ]);
+
+  const state = createMissionState(
+    { question: 'write me a story and store it in a google doc', canWrite: true },
+    env
+  );
+  const out = await runMission(state, { env, fetchImpl: world });
+
+  assert.deepEqual(
+    out.state.artifacts.map((a) => a.id),
+    ['doc1'],
+    'the document is remembered — and the task list itself is not an artifact'
+  );
+
+  const second = world.prompts.find((p) => p.includes('YOUR TASK NOW is step 2'));
+  assert.ok(second, 'the second step ran');
+  assert.match(second, /ALREADY CREATED/);
+  assert.match(second, /doc1/, 'and by id, so it can be opened rather than searched for');
+  assert.match(second, /Flower and Tomato/);
+  assert.match(second, /Do not create a second copy/);
+
+  // Only one document was ever asked for.
+  const made = world.google.calls.filter(
+    (c) => c.method === 'POST' && c.href.includes('docs.googleapis.com/v1/documents') && !c.href.includes('batchUpdate')
+  );
+  assert.equal(made.length, 1, 'one document, not three');
+});
+
+await test('the wrap-up is told what exists, so it can hand over the link', async () => {
+  const env = { ...MISSION_ENV, ...G_ENV };
+  const world = missionWorldWithDocs([
+    PLAN_CALL,
+    say('Planned', 'Saved the list.'),
+    CREATE_DOC,
+    say('Written', 'Wrote it.'),
+    say('Checked', 'Done.'),
+    say('Done', 'It is ready.'),
+  ]);
+
+  const state = createMissionState({ question: 'write me a story in a doc', canWrite: true }, env);
+  await runMission(state, { env, fetchImpl: world });
+
+  const wrapUp = world.prompts[world.prompts.length - 1];
+  assert.match(wrapUp, /What now exists/);
+  assert.match(wrapUp, /docs.google.com/);
+});
+
+section('a mission that loses its summary');
+
+function finishedMission(overrides = {}) {
+  return {
+    ...createMissionState({ question: 'write me a story in a doc', canWrite: true }, MISSION_ENV),
+    phase: 'wrapping',
+    tasksDone: 2,
+    tasks: [
+      { n: 1, title: 'Write the story into a document', done: true },
+      { n: 2, title: 'Read it back', done: true },
+    ],
+    notes: ['Step 1: wrote it.', 'Step 2: read it back.'],
+    artifacts: [
+      {
+        id: 'doc1',
+        tool: 'create_doc',
+        label: 'Flower and Tomato',
+        link: 'https://docs.google.com/document/d/doc1/edit',
+        step: 1,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+await test('a finished mission reports itself without the model', () => {
+  // The wrap-up run is the one most likely to be cut short, and everything it
+  // would have described already exists.
+  const out = missionSummary(finishedMission(), { error: 'The model is rate limited right now.' });
+
+  assert.equal(out.incomplete, undefined, 'every step was done — this is not a half-finished run');
+  assert.equal(out.title, 'Done');
+  assert.match(out.answer, /Flower and Tomato/);
+  assert.match(out.answer, /docs.google.com/);
+  assert.match(out.detail, /wrote it/i, 'the notes are the only account of what happened');
+});
+
+await test('a mission that stopped mid-list is honest about it, and still says what it made', () => {
+  const out = missionSummary(
+    finishedMission({
+      phase: 'working',
+      tasksDone: 1,
+      tasks: [
+        { n: 1, title: 'Write the story into a document', done: true },
+        { n: 2, title: 'Read it back', done: false },
+      ],
+    }),
+    { error: 'The model is rate limited right now.' }
+  );
+
+  assert.equal(out.incomplete, true);
+  assert.equal(out.title, 'Stopped early');
+  assert.match(out.answer, /1 of 2/);
+  assert.match(out.answer, /rate limited/);
+  assert.match(out.answer, /Flower and Tomato/, 'the document exists whatever went wrong after it');
+});
+
+await test('a mission that produced nothing is still a plain failure', () => {
+  const bare = createMissionState({ question: 'write me a story', canWrite: true }, MISSION_ENV);
+  assert.equal(bare.tasksDone, 0);
+  assert.equal((bare.artifacts || []).length, 0);
+});
+
 section('missions over HTTP');
 
 await test('a mission request without write authority is demoted, not failed', async () => {
@@ -4898,6 +5060,124 @@ await test('a mission request with write authority starts a mission', async () =
   assert.equal(jobsDb.state.jobs[0].state.kind, 'mission');
   assert.equal(jobsDb.state.jobs[0].state.phase, 'planning');
   assert.match(res.json().answer, /notification/i, 'the caller is told how they will hear back');
+});
+
+/** A mission job parked in its final phase, with the document already made. */
+function seedFinishedMissionJob(jobsDb, overrides = {}) {
+  const state = {
+    ...createMissionState({ question: 'write me a story and store it in a google doc', canWrite: true }, MISSION_ENV),
+    phase: 'wrapping',
+    planId: 1,
+    tasksDone: 1,
+    tasks: [{ n: 1, title: 'Write the story into a document', done: true }],
+    notes: ['Step 1: wrote the story into a document.'],
+    artifacts: [
+      {
+        id: 'doc1',
+        tool: 'create_doc',
+        label: 'Flower and Tomato',
+        link: 'https://docs.google.com/document/d/doc1/edit',
+        step: 1,
+      },
+    ],
+    ...overrides,
+  };
+
+  jobsDb.state.jobs.push({
+    id: 'job-m',
+    status: 'running',
+    steps: 4,
+    events: [],
+    created_at: 'now',
+    question: 'write me a story and store it in a google doc',
+    state,
+  });
+
+  return state;
+}
+
+function stepJob(id = 'job-m') {
+  return fakeReq({ url: '/api/step', body: { jobId: id, token: createJobToken(id, process.env) } });
+}
+
+await test('a mission that broke at the last moment reports the document, not a failure', async () => {
+  // What actually happened: every step succeeded, the wrap-up hit a rate limit,
+  // and the user was told the whole thing failed while the document sat in
+  // their Drive.
+  applyEnv({ ...J_ENV, OSCAR_OPENAI_MAX_ATTEMPTS: '1' });
+  const jobsDb = fakeJobsDb();
+  seedFinishedMissionJob(jobsDb);
+  const openai = fakeOpenAI('insufficient_quota — check your billing', { status: 429 });
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : openai(url, init);
+
+  const res = fakeRes();
+  await stepHandler(stepJob(), res);
+
+  assert.equal(res.json().status, 'done');
+  const stored = jobsDb.state.jobs[0];
+  assert.equal(stored.status, 'done', 'a finished mission is not a failed job');
+  assert.match(stored.answer, /Flower and Tomato/);
+  assert.match(stored.answer, /docs.google.com/, 'the link is the whole point of the answer');
+});
+
+await test('a mission stopped mid-list is recorded as stopped early, not failed', async () => {
+  applyEnv({ ...J_ENV, OSCAR_OPENAI_MAX_ATTEMPTS: '1' });
+  const jobsDb = fakeJobsDb();
+  seedFinishedMissionJob(jobsDb, {
+    phase: 'working',
+    tasks: [
+      { n: 1, title: 'Write the story into a document', done: true },
+      { n: 2, title: 'Read it back', done: false },
+    ],
+  });
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase')
+      ? jobsDb(url, init)
+      : fakeOpenAI('insufficient_quota', { status: 429 })(url, init);
+
+  const res = fakeRes();
+  await stepHandler(stepJob(), res);
+
+  assert.equal(res.json().status, 'incomplete');
+  assert.equal(jobsDb.state.jobs[0].status, 'incomplete');
+  assert.match(jobsDb.state.jobs[0].answer, /1 of 2/);
+});
+
+await test('a rate limit hands the round to a fresh invocation rather than failing', async () => {
+  applyEnv({ ...J_ENV, OSCAR_OPENAI_MAX_ATTEMPTS: '1' });
+  const jobsDb = fakeJobsDb();
+  seedFinishedMissionJob(jobsDb);
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase')
+      ? jobsDb(url, init)
+      : fakeOpenAI('Rate limit reached for gpt-4o, try again in 2s', { status: 429 })(url, init);
+
+  const res = fakeRes();
+  await stepHandler(stepJob(), res);
+
+  assert.equal(res.json().status, 'running', 'the round is worth another go, with a fresh budget');
+  const stored = jobsDb.state.jobs[0];
+  assert.equal(stored.status, 'running');
+  assert.equal(stored.state.stalls, 1, 'and the attempt is counted, so this cannot loop forever');
+});
+
+await test('a provider that stays down ends the job instead of hopping forever', async () => {
+  applyEnv({ ...J_ENV, OSCAR_OPENAI_MAX_ATTEMPTS: '1' });
+  const jobsDb = fakeJobsDb();
+  seedFinishedMissionJob(jobsDb, { stalls: 5 });
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase')
+      ? jobsDb(url, init)
+      : fakeOpenAI('Rate limit reached for gpt-4o, try again in 2s', { status: 429 })(url, init);
+
+  const res = fakeRes();
+  await stepHandler(stepJob(), res);
+
+  // Out of handoffs — but the mission still had a document to show for itself,
+  // so it is reported rather than thrown away.
+  assert.notEqual(res.json().status, 'running');
+  assert.match(jobsDb.state.jobs[0].answer, /docs.google.com/);
 });
 
 /* ==========================================================================

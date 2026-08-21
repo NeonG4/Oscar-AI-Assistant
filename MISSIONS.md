@@ -32,6 +32,8 @@ Between steps the agent is **thrown away**. What survives is:
 
 - **the task list** — which steps exist, which are done. The durable memory.
 - **the notes** — one line per finished step, carried into the next.
+- **the ledger** — everything the mission has *made*: the document, the file,
+  the calendar entry. Id, name and link.
 
 That's the whole trick. Each step begins with only the goal, the task list, the
 notes so far, and the single step it's meant to do. **Step 8 costs about what step 1
@@ -40,6 +42,28 @@ cost**, so a mission of thirty steps is as affordable as a mission of three.
 The note is what a step chose to pass forward — a filename, a decision, a value
 it found. Steps are told explicitly that this sentence is the only thing carried
 on, so they should put what matters in it.
+
+### Why the ledger exists
+
+A step with no memory of the one before it will make a second copy of whatever
+that one made. Told "save it to a document", with nothing in front of it saying a
+document exists, creating one is the obedient thing to do — and you end up with
+the outline in one file, the story in another, and an empty third.
+
+So every step is handed the list of what already exists, by id:
+
+```
+ALREADY CREATED by earlier steps of this mission:
+  - Flower and Tomato (create_doc, id 1AbC…) — https://docs.google.com/…
+
+Those already exist. If your step involves any of them, work on THAT one
+— read it by the id above, append to it, update it.
+```
+
+Only things a tool actually *created* are listed; a document the mission merely
+read is not a thing the mission made. The planner is pushed the same way from
+the other end: **one step owns one thing**, produced finished, and a goal that is
+really one action gets a one-step list.
 
 ---
 
@@ -52,8 +76,13 @@ up with**: words to read is `deep`, working software is `mission`.
 | --- | --- |
 | "write me a story about a fox" | deep |
 | "build me a workout plan" | deep |
+| "write me a story and put it in a Google Doc" | deep |
 | "write me a connect 4 program" | **mission** |
 | "build a script that scans my repos" | **mission** |
+
+Where the words end up makes no difference. A story is a story whether it is
+spoken, emailed or saved into a Doc — asking for one to be filed somewhere is
+still one piece of writing and one tool call, not a project.
 
 The keyword check is deliberately narrow — it needs both a building verb *and* a
 buildable noun. A mission runs unattended for dozens of model calls, so a false
@@ -92,6 +121,20 @@ would be worse than an incomplete result.
 
 **A mission that runs away** stops at 300 rounds and tells you how far it got.
 Past that it's stuck, not thorough.
+
+**A mission that breaks after doing real work is not reported as a failure.**
+The run most likely to be cut short is the wrap-up — it happens last, after an
+hour of hammering the provider, and its only job is to describe things that
+already exist. Losing it used to turn a finished mission into "Oscar got stuck"
+while the document sat in your Drive. Now the mission writes its own answer from
+its notes and its ledger: what it made, with the link, and an honest **stopped
+early** if it didn't get through the list.
+
+**A provider saying "not right now"** doesn't end the mission either. When the
+backoff has waited as long as one invocation can afford, the round is handed to a
+fresh one with a fresh budget — five times, after which the mission reports what
+it has. A 429 that means *no quota left* is excluded, since it will say the same
+thing in an hour.
 
 **A goal that needs no task list** — where the model declined to break it down —
 answers directly instead of retrying. For a goal that turned out to be a
@@ -138,3 +181,5 @@ group by p.id order by p.created_at desc;
 | No notification when it finished | Push isn't set up, or no device subscribed. See [PUSH.md](PUSH.md) |
 | "Gave up after 300 steps" | It was looping. The task list is still there — look at which step it stuck on |
 | Steps are vague and unhelpful | The planning run got a thin goal. Ask for the thing you want more specifically |
+| Two documents where you wanted one | The task list split making a thing from filling it in. Look at the plan row — the steps are still there |
+| "Stopped early" with a link in it | The work landed, the run didn't finish. The link is real; the list wasn't completed |
