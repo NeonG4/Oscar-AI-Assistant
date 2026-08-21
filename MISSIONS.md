@@ -15,11 +15,11 @@ twenty tool calls the message history is enormous, every round re-sends all of
 it, and the model's attention is spread across everything it has ever done
 rather than the thing in front of it. Cost climbs and quality falls, together.
 
-A **mission** doesn't keep one long conversation. It keeps a **plan**, and runs
-a separate short conversation for each step of it.
+A **mission** doesn't keep one long conversation. It keeps a **task list**, and
+runs a separate short conversation for each step of it.
 
 ```
-  planning     one run, whose only job is to produce a plan
+  planning     one run, whose only job is to produce the task list
      ↓
   working      one run per step, in order — each starting fresh
      ↓
@@ -30,11 +30,11 @@ a separate short conversation for each step of it.
 
 Between steps the agent is **thrown away**. What survives is:
 
-- **the plan** — which steps exist, which are done. The durable memory.
+- **the task list** — which steps exist, which are done. The durable memory.
 - **the notes** — one line per finished step, carried into the next.
 
-That's the whole trick. Each task begins with only the goal, the plan, the notes
-so far, and the single step it's meant to do. **Step 8 costs about what step 1
+That's the whole trick. Each step begins with only the goal, the task list, the
+notes so far, and the single step it's meant to do. **Step 8 costs about what step 1
 cost**, so a mission of thirty steps is as affordable as a mission of three.
 
 The note is what a step chose to pass forward — a filename, a decision, a value
@@ -69,10 +69,10 @@ To force it either way, pass `mode` in the request body:
 
 ### Requirements
 
-- **`OSCAR_ALLOW_WRITES=1`.** A mission saves a plan and then acts on it. Without
+- **`OSCAR_ALLOW_WRITES=1`.** A mission saves its task list and then acts on it. Without
   write authority it couldn't store its own task list, so a mission request is
   quietly **demoted to `deep`** rather than started and failed one step later.
-- **Supabase**, for the plan and the job.
+- **Supabase**, for the task list and the job.
 - **Notifications** ([PUSH.md](PUSH.md)) if you want to hear about it. Optional,
   but the point of a mission is not watching it.
 - **The runner** ([RUNNER.md](RUNNER.md)) if the mission needs to write files or
@@ -93,7 +93,7 @@ would be worse than an incomplete result.
 **A mission that runs away** stops at 300 rounds and tells you how far it got.
 Past that it's stuck, not thorough.
 
-**A goal that needs no plan** — where the model declined to break it down —
+**A goal that needs no task list** — where the model declined to break it down —
 answers directly instead of retrying. For a goal that turned out to be a
 one-liner, that's the right outcome anyway.
 
@@ -111,9 +111,13 @@ anything it doesn't recognise.
 Open Oscar while it's running. The activity log shows each tool call as it
 happens, the same as any job.
 
-Or look at the plan directly — it's a normal plan, so *"what's next on my
-connect 4 plan?"* works while the mission is still going. When the mission
-finishes, the plan is marked `done` so it stops showing up as active work.
+Or look at the list directly. A mission's task list is Oscar's own breakdown of
+the goal, but it is *stored* as a row in the `plans` table — the same drawer as
+the plans you save for yourself. That has two consequences worth knowing:
+*"what's next on my connect 4 plan?"* works while the mission is still going,
+and his working memory turns up in `list_plans` next to your own things. When
+the mission finishes the row is marked `done`, so it stops showing up as active
+work.
 
 ```sql
 select p.title, p.status,
@@ -130,7 +134,7 @@ group by p.id order by p.created_at desc;
 | --- | --- |
 | Asked for a program, got prose | Routed `deep`. Force it with `"mode": "mission"` |
 | `mode` comes back `deep` on a mission request | No write authority — `OSCAR_ALLOW_WRITES` isn't `1`, or the request had none |
-| Mission plans, then every step fails | Probably needs the runner. See [RUNNER.md](RUNNER.md) |
+| Mission draws up its list, then every step fails | Probably needs the runner. See [RUNNER.md](RUNNER.md) |
 | No notification when it finished | Push isn't set up, or no device subscribed. See [PUSH.md](PUSH.md) |
-| "Gave up after 300 steps" | It was looping. The plan is still there — look at which step it stuck on |
+| "Gave up after 300 steps" | It was looping. The task list is still there — look at which step it stuck on |
 | Steps are vague and unhelpful | The planning run got a thin goal. Ask for the thing you want more specifically |

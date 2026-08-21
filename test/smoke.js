@@ -4445,7 +4445,7 @@ await test('the mission ceiling is far above a job\'s, and still finite', () => 
 section('missions over HTTP');
 
 await test('a mission request without write authority is demoted, not failed', async () => {
-  // It could not save its own plan, so starting one would fail a step later.
+  // It could not save its own task list, so starting one would fail a step later.
   applyEnv({ ...MISSION_ENV, OSCAR_SHARED_SECRET: 'letmein', OSCAR_ALLOW_WRITES: '0' });
   const jobsDb = fakeJobsDb();
   globalThis.fetch = async (url, init) =>

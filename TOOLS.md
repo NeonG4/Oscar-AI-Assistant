@@ -19,6 +19,15 @@ need [SUPABASE.md](./SUPABASE.md); weather and location work out of the box. Any
 proved write authority, and anything destructive asks first when dictated — see
 [Destructive actions](#destructive-actions).
 
+**Three of those tool groups make a list of steps, and they belong to different
+people.** A **task** is Oscar's: `plan_tasks` and `finish_task` edit the list he
+shows his working on, and it dies with the run. A **plan** is yours:
+`create_plan` and the rest of that group save it in the database for you to tick
+off next week. A **to-do** is yours as well, but it lives in your Google account
+— that is what `list_tasks` and `create_task` reach. Google calls its to-dos
+"tasks", which is exactly why the line is worth stating out loud: in this
+codebase an unqualified **task is always Oscar's own**.
+
 ```
 you: "do I need a jacket?"
          │
@@ -265,11 +274,12 @@ There's no permanent-loss path that doesn't ask first.
 
 ---
 
-## Task lists — showing the working
+## Tasks — Oscar showing his working
 
 Anything that takes more than one step gets a list first. Oscar calls
 `plan_tasks` with what he is about to do, then `finish_task` after each one, and
-the web console renders the list ticking off as it happens.
+the web console renders the list ticking off as it happens. This list is his,
+not yours — you watch it, you never tick it off.
 
 ```
 you: "compare the two flights and tell me which is better"
@@ -302,19 +312,26 @@ and Oscar's from drifting apart over a long run.
 | `plan_tasks` | | 2–12 ordered tasks, at the start of a run. Refuses a list of one |
 | `finish_task` | | Ticks task N off, with one line on how it went |
 
-### Task lists vs plans vs missions
+### Tasks vs plans vs to-dos vs missions
 
-Three similar-sounding things, told apart by how long they last:
+Four similar-sounding things, told apart by whose they are and how long they
+last:
 
-| | Lives for | Stored in | You can |
-| --- | --- | --- | --- |
-| **Task list** | one run | the run's state | watch it |
-| **Plan** | until you delete it | `plans` table | tick steps off next week |
-| **Mission** | one run, working a plan | `jobs` + `plans` | watch it and keep the plan |
+| | Whose | Lives for | Stored in | You can |
+| --- | --- | --- | --- | --- |
+| **Task** | Oscar's | one run | the run's state | watch it |
+| **Plan** | yours | until you delete it | `plans` table | tick steps off next week |
+| **To-do** | yours | until you delete it | your Google account | ask him to add or tick one |
+| **Mission** | Oscar's | one run, working its own list | `jobs` + `plans` | watch it, and keep what it built |
 
-A mission does not call `plan_tasks` — the plan it is working through IS its
-task list, and `lib/missions.js` mirrors the plan's steps into the same shape so
-the console renders both identically.
+A mission does not call `plan_tasks`. It draws up its own list at the start and
+`lib/missions.js` mirrors that list into the same shape, so the console renders
+both identically.
+
+One overlap to know about: a mission's task list is *stored* as a row in the
+`plans` table. Oscar's working memory therefore shares a drawer with the plans
+you saved yourself, and shows up in `list_plans` alongside them. The words are
+now kept apart everywhere they are used; the storage is not.
 
 ---
 

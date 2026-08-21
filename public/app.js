@@ -752,8 +752,8 @@ function updateActivityEmpty() {
  * What Oscar decided to do, and how far through it he is.
  *
  * The list arrives from the server the same way for both kinds of run: an
- * ordinary job builds it by calling plan_tasks, and a mission mirrors the steps
- * of its saved plan into the same shape. This function does not care which.
+ * ordinary job builds it by calling plan_tasks, and a mission mirrors its own
+ * stored steps into the same shape. This function does not care which.
  */
 function renderTasks(tasks) {
   const list = Array.isArray(tasks) ? tasks : [];

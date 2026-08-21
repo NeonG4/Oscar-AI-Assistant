@@ -48,20 +48,20 @@ for an answer written to fit on a lock screen.
 | `lib/confirm.js`    | Signed, short-lived confirmation tokens for deletes.                      |
 | `lib/jobs.js`       | Async runs, checkpointed between serverless invocations.                  |
 | `lib/router.js`     | Decides fast-inline vs deep-background vs mission, and which model.       |
-| `lib/missions.js`   | Work that plans itself then does itself. The plan is the memory.          |
+| `lib/missions.js`   | Work that plans itself then does itself. Its task list is the memory.     |
 | `lib/questions.js`  | Things Oscar has stopped to ask you, and your answers.                   |
 | `lib/tools/questions.js` | `ask_user`: suspends the run until you reply.                        |
-| `lib/tasklist.js`   | The task list of one run: what Oscar planned, and where he has got to.   |
+| `lib/tasklist.js`   | Oscar's own list for one run: what he decided to do, and where he has got to. |
 | `lib/tools/checklist.js` | `plan_tasks` / `finish_task`: how that list gets made and ticked off. |
 | `api/questions.js`  | Read what's waiting, answer it, and wake the run back up.                |
 | `lib/db.js`         | Supabase logging over plain HTTPS. No-ops when unconfigured.              |
 | `lib/tools/location.js` | Where am I / where is X. GPS, IP and geocoding.                       |
 | `lib/tools/weather.js`  | Current conditions and forecast, via Open-Meteo.                      |
 | `lib/tools/calendar.js` | Google Calendar: read the schedule, add events.                        |
-| `lib/tools/tasks.js`    | Google Tasks: read, add, tick off.                                     |
+| `lib/tools/tasks.js`    | Your Google Tasks to-do list: read, add, tick off.                      |
 | `lib/tools/gmail.js`    | Gmail: search, read, draft, send. No delete, by design.                |
 | `lib/google/auth.js`    | OAuth refresh-token exchange and the Google API wrapper.               |
-| `lib/tools/plans.js`    | Plans: goals broken into ordered steps you can tick off.               |
+| `lib/tools/plans.js`    | Your plans: goals broken into ordered steps you can tick off.          |
 | `lib/plans.js`          | Plan storage in Supabase. Owned data, not someone else's API.          |
 | `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
 | `lib/tools/shell.js`    | `run_cmd` / `check_cmd`: commands queued for your own computer.        |

@@ -275,16 +275,17 @@ export default async function handler(req, res) {
       model: route.model,
     };
 
-    // A mission plans itself and then carries the plan out, which means writing
-    // things. Without write authority it could not even save the plan, so it is
-    // quietly demoted rather than started and failed one step later.
+    // A mission breaks the goal into its own task list and then carries that
+    // out, which means writing things. Without write authority it could not
+    // even save the list, so it is quietly demoted rather than started and
+    // failed one step later.
     const wantsMission = route.mode === 'mission' && writeAllowed;
     const backgroundMode = wantsMission ? 'mission' : route.mode === 'mission' ? 'deep' : route.mode;
 
     // Work heading for the background has already been judged multi-step, and
-    // somebody is watching a progress panel for it. A mission is exempt: its
-    // saved plan IS the task list, so asking for a second one would show two
-    // competing versions of the same thing.
+    // somebody is watching a progress panel for it. A mission is exempt: the
+    // list it drew up at the start already IS its task list, so asking for a
+    // second one would show two competing versions of the same thing.
     const backgroundAgent = { ...agentInput, requireTasks: backgroundMode === 'deep' };
 
     if (backgroundMode !== 'fast' && isJobsConfigured() && body.async !== false) {
