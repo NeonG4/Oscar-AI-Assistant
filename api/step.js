@@ -157,7 +157,17 @@ export default async function handler(req, res) {
     const authorised = readJobToken(body.token, process.env) === String(jobId) || Boolean(getSession(req));
     if (!authorised) return send(res, 401, { ok: false, error: 'Not authorised to advance this job.' });
 
-    job = await loadJob(jobId);
+    try {
+      job = await loadJob(jobId);
+    } catch (err) {
+      // Removed from the Jobs tab while it was still going. Nothing to advance,
+      // nothing to mark failed, and nobody to tell — the row that would have
+      // recorded any of that is precisely the thing that was deleted.
+      if (err instanceof JobError && err.status === 404) {
+        return send(res, 200, { ok: true, status: 'gone', finished: true });
+      }
+      throw err;
+    }
 
     // Terminal, or waiting on a human. Either way there is nothing to do, and
     // saying so plainly stops a caller from retrying in a loop.

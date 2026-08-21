@@ -110,9 +110,9 @@ const el = {
 const ENDPOINT = new URL('/api/ask', location.origin).toString();
 
 /** `credentials: same-origin` so the session cookie rides along. */
-async function api(path, body) {
+async function api(path, body, method) {
   const res = await fetch(path, {
-    method: body ? 'POST' : 'GET',
+    method: method || (body ? 'POST' : 'GET'),
     credentials: 'same-origin',
     cache: 'no-store',
     headers: body ? { 'content-type': 'application/json' } : undefined,
@@ -1316,15 +1316,98 @@ function jobNode(job) {
   const open = document.createElement('button');
   open.type = 'button';
   open.className = 'ghost small';
-  open.textContent = ACTIVE_STATUSES.has(job.status)
+  open.textContent = active
     ? 'Watch it work'
     : job.conversationId
       ? 'Open conversation'
       : 'Open this job';
   open.addEventListener('click', () => openJob(job));
-  node.append(open);
+
+  node.append(rowOf(open, removeButton(job, node, active)));
 
   return node;
+}
+
+/** A flex row, for the pair of buttons at the foot of a job card. */
+function rowOf(...buttons) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.append(...buttons);
+  return row;
+}
+
+/**
+ * "Remove", which asks once before it means it.
+ *
+ * Two taps rather than a dialog: the first turns the button into the question
+ * and the second answers it. Removing a job cannot be undone, so one stray tap
+ * must never be enough — but a modal for something this small would be worse
+ * than the problem it solves. The armed state gives up after five seconds, so a
+ * button left half-pressed goes back to being safe on its own.
+ *
+ * A job still working can be removed too. The server refuses that without an
+ * explicit `force`, which this passes only for a card that is actually live —
+ * the case worth having, because a run that has gone wrong is exactly the one
+ * you want gone.
+ */
+function removeButton(job, node, active) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'ghost small';
+  button.textContent = 'Remove';
+
+  let armed = false;
+  let timer = null;
+
+  const disarm = () => {
+    clearTimeout(timer);
+    timer = null;
+    armed = false;
+    button.className = 'ghost small';
+    button.textContent = 'Remove';
+  };
+
+  button.addEventListener('click', async () => {
+    if (!armed) {
+      armed = true;
+      button.className = 'danger small';
+      button.textContent = active ? 'Remove anyway?' : 'Remove for good?';
+      timer = setTimeout(disarm, 5000);
+      return;
+    }
+
+    clearTimeout(timer);
+    button.disabled = true;
+    button.textContent = 'Removing…';
+
+    try {
+      const { res, data } = await api(
+        `/api/jobs?id=${encodeURIComponent(job.id)}${active ? '&force=1' : ''}`,
+        null,
+        'DELETE'
+      );
+
+      if (!res.ok) {
+        button.disabled = false;
+        disarm();
+        el.jobsMeta.textContent = (data && data.error) || 'Could not remove that job.';
+        return;
+      }
+
+      // Stop following a job that no longer exists, or the next poll would
+      // report it as lost rather than as gone on purpose.
+      if (watchingJob === job.id) stopWatching();
+
+      node.remove();
+      loadJobs().catch(() => {});
+    } catch (err) {
+      button.disabled = false;
+      disarm();
+      el.jobsMeta.textContent = String((err && err.message) || err);
+    }
+  });
+
+  return button;
 }
 
 /**

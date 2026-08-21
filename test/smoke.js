@@ -22,6 +22,7 @@ import {
   sanitizeHistory,
   AgentError,
   MAX_EARLY_FINISH_NUDGES,
+  buildSystemPrompt,
 } from '../lib/agent.js';
 import {
   createChallenge,
@@ -311,6 +312,22 @@ console.log('\noscar smoke tests');
 
 /* ===================================================================== agent */
 section('agent');
+
+await test('the prompt says the computer is usable only when run_cmd is there', () => {
+  // Oscar kept telling David it could not touch his computer while holding a
+  // working run_cmd. The tool schema alone was not enough — nothing in the
+  // prompt mentioned the machine, so the model answered from its persona.
+  const withRunner = buildSystemPrompt({ tools: true, canRunCommands: true });
+  assert.match(withRunner, /YOU CAN USE THEIR COMPUTER/);
+  assert.match(withRunner, /run_cmd/);
+  assert.match(withRunner, /pwsh/);
+
+  // And the other half, which matters just as much: on the read-only path the
+  // tool is withheld, so claiming the capability would be a lie.
+  const without = buildSystemPrompt({ tools: true, canRunCommands: false });
+  assert.doesNotMatch(without, /YOU CAN USE THEIR COMPUTER/);
+  assert.doesNotMatch(without, /run_cmd/);
+});
 
 await test('clampWords truncates on a word boundary', () => {
   assert.equal(clampWords('one two three four', 2), 'one two…');
@@ -3098,6 +3115,11 @@ function fakeJobsDb() {
       state.jobs = state.jobs.map((j) => (j.id === id ? { ...j, ...body } : j));
       return json(null, 204);
     }
+    if (method === 'DELETE') {
+      const id = idOf();
+      state.jobs = state.jobs.filter((j) => j.id !== id);
+      return json(null, 204);
+    }
     const id = idOf();
     return json(id ? state.jobs.filter((j) => j.id === id) : state.jobs);
   };
@@ -3445,6 +3467,90 @@ await test('a job that stops with tasks open is recorded as incomplete', async (
   const stored = jobsDb.state.jobs[0];
   assert.equal(stored.status, 'incomplete', 'never "done" over a list that is not');
   assert.equal(stored.tasks.filter((t) => t.done).length, 0, 'and the open tasks are still open');
+});
+
+/* --------------------------------------------------------------------------
+ *  REMOVING A JOB
+ *
+ *  Deleting the row is the whole record of a run gone, so the interesting parts
+ *  are who may do it and what stops a live run being pulled out from under
+ *  itself — not the delete itself.
+ * ------------------------------------------------------------------------ */
+
+const OWNER_COOKIE = () => `oscar_session=${createSession('owner@example.com', SECRET)}`;
+
+await test('removing a job needs a session, not just its own token', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  jobsDb.state.jobs.push({ id: 'job-del', status: 'done', question: 'q', answer: 'a', steps: 1, events: [] });
+  globalThis.fetch = jobsDb;
+
+  const res = fakeRes();
+  const token = createJobToken('job-del', process.env);
+  await jobsHandler(
+    fakeReq({ method: 'DELETE', url: `/api/jobs?id=job-del&token=${encodeURIComponent(token)}` }),
+    res
+  );
+
+  assert.equal(res.statusCode, 401, 'a job token watches its job; it does not delete it');
+  assert.equal(jobsDb.state.jobs.length, 1, 'and nothing was removed');
+});
+
+await test('a finished job can be removed from the list', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  jobsDb.state.jobs.push({ id: 'job-del', status: 'done', question: 'q', answer: 'a', steps: 1, events: [] });
+  globalThis.fetch = jobsDb;
+
+  const res = fakeRes();
+  await jobsHandler(
+    fakeReq({ method: 'DELETE', url: '/api/jobs?id=job-del', cookie: OWNER_COOKIE() }),
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().was, 'done', 'it says what it removed');
+  assert.equal(jobsDb.state.jobs.length, 0);
+});
+
+await test('a job that is still working is not removed by accident', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  jobsDb.state.jobs.push({ id: 'job-live', status: 'running', question: 'q', steps: 2, events: [] });
+  globalThis.fetch = jobsDb;
+
+  const refused = fakeRes();
+  await jobsHandler(
+    fakeReq({ method: 'DELETE', url: '/api/jobs?id=job-live', cookie: OWNER_COOKIE() }),
+    refused
+  );
+  assert.equal(refused.statusCode, 409, 'a live run does not go on one tap');
+  assert.equal(jobsDb.state.jobs.length, 1);
+
+  const forced = fakeRes();
+  await jobsHandler(
+    fakeReq({ method: 'DELETE', url: '/api/jobs?id=job-live&force=1', cookie: OWNER_COOKIE() }),
+    forced
+  );
+  assert.equal(forced.statusCode, 200, 'saying you mean it is enough');
+  assert.equal(jobsDb.state.jobs.length, 0);
+});
+
+await test('stepping a job that has been removed stops quietly', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb(); // empty — the row was deleted mid-run
+  globalThis.fetch = jobsDb;
+
+  const res = fakeRes();
+  await stepHandler(
+    fakeReq({ url: '/api/step', body: { jobId: 'job-gone', token: createJobToken('job-gone', process.env) } }),
+    res
+  );
+
+  const out = res.json();
+  assert.equal(res.statusCode, 200);
+  assert.equal(out.ok, true, 'a job you deleted is not a failure to report');
+  assert.equal(out.status, 'gone');
 });
 
 /* ==========================================================================

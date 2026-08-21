@@ -1,8 +1,9 @@
 /**
  * api/jobs.js
  * ----------------------------------------------------------------------------
- *   GET  /api/jobs?id=<uuid>   one job: status, live event trace, answer
- *   GET  /api/jobs             recent jobs
+ *   GET     /api/jobs?id=<uuid>   one job: status, live event trace, answer
+ *   GET     /api/jobs             recent jobs
+ *   DELETE  /api/jobs?id=<uuid>   remove one from the list, for good
  *
  * Creating a job is not done here — /api/ask does it, because the decision to
  * go async is the router's, and the Shortcut should only ever need one URL.
@@ -18,7 +19,7 @@
 
 import { getSession } from '../lib/auth.js';
 import { applyCors, send } from '../lib/http.js';
-import { getJob, listJobs, readJobToken, isJobsConfigured, JobError } from '../lib/jobs.js';
+import { getJob, listJobs, deleteJob, readJobToken, isJobsConfigured, JobError } from '../lib/jobs.js';
 
 export default async function handler(req, res) {
   applyCors(req, res);
@@ -26,7 +27,9 @@ export default async function handler(req, res) {
     res.statusCode = 204;
     return res.end();
   }
-  if (req.method !== 'GET') return send(res, 405, { ok: false, error: 'Use GET.' });
+  if (req.method !== 'GET' && req.method !== 'DELETE') {
+    return send(res, 405, { ok: false, error: 'Use GET to read a job, or DELETE to remove one.' });
+  }
 
   if (!isJobsConfigured()) {
     return send(res, 200, { ok: true, configured: false, jobs: [], error: 'No database configured.' });
@@ -44,6 +47,16 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (req.method === 'DELETE') {
+      // Removing is archive-level authority, like listing: a single-job token
+      // lets a caller watch the job it started, never delete it.
+      if (!signedIn) return send(res, 401, { ok: false, error: 'Sign in to remove a job.' });
+      if (!id) return send(res, 400, { ok: false, error: 'Which job? Pass ?id=' });
+
+      const gone = await deleteJob(id, { force: url.searchParams.get('force') === '1' });
+      return send(res, 200, { ok: true, removed: true, was: gone.was });
+    }
+
     if (id) {
       return send(res, 200, { ok: true, configured: true, job: await getJob(id) });
     }

@@ -37,7 +37,7 @@ for an answer written to fit on a lock screen.
 | `api/auth.js`       | Login: password → emailed code → session cookie. Also logout.             |
 | `api/session.js`    | "Am I signed in?" — the page asks this on load.                          |
 | `api/confirm.js`    | Phase two of a destructive action: verify the token, then act.             |
-| `api/jobs.js`       | Read background jobs: status, live tool trace, answer.                    |
+| `api/jobs.js`       | Background jobs: status, live tool trace, answer — and removing one.      |
 | `api/step.js`       | Advances one job per invocation. This is what removes the 60s ceiling.    |
 | `api/history.js`    | Reads back the log. Session login only — not the Shortcut key.            |
 | `api/health.js`     | `GET /api/health` — confirms your env vars landed. Never echoes them.     |
@@ -168,7 +168,7 @@ Four tabs, along the bottom:
 | Tab          | What it is                                                                  |
 | ------------ | --------------------------------------------------------------------------- |
 | **Ask**      | The conversation. Follow-ups carry on from the answer before them, and Oscar's thinking sits underneath — the tasks he planned, ticking off as he finishes them. |
-| **Jobs**     | Anything too heavy to answer on the end of a request, with its task list and how far through it is. Needs Supabase. |
+| **Jobs**     | Anything too heavy to answer on the end of a request, with its task list and how far through it is. **Remove** clears one out for good — it asks once first, and twice for a job still working. The answer stays in History. Needs Supabase. |
 | **History**  | Every exchange, grouped back into the conversations they happened in. Reopen one and carry on with it. Needs Supabase. |
 | **Settings** | How much of the machinery you want to see, plus notifications and the Shortcut endpoint. |
 
