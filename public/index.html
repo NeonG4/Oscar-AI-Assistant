@@ -240,6 +240,32 @@
 
       <!-- -------------------- settings -------------------- -->
       <div id="pane-settings" class="pane" hidden>
+        <!--
+          First card in the pane, deliberately. Everything below it changes what
+          you see; this changes what Oscar keeps, and it is stored on the server
+          rather than in this browser because it has to hold for the Shortcut on
+          your phone and for jobs running while this tab is closed.
+        -->
+        <section class="card" aria-labelledby="catching-h">
+          <h2 id="catching-h">Remembering people</h2>
+
+          <label class="toggle">
+            <input type="checkbox" id="set-catching" />
+            <span>
+              <b>Background catching</b>
+              <em>
+                Pick up the people you mention as you talk — who they are to you,
+                and how to reach them — without being asked. Say "I'm writing to
+                my sister Olivia" and Olivia is filed as your sister. Only facts
+                that stay true; never how somebody is feeling today. With this
+                off, people are saved only when you ask for it.
+              </em>
+            </span>
+          </label>
+
+          <p class="meta subtle choice-note" id="catching-note">Loading…</p>
+        </section>
+
         <section class="card" aria-labelledby="display-h">
           <h2 id="display-h">Display</h2>
 

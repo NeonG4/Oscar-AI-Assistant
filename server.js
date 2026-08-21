@@ -44,6 +44,7 @@ const routes = {
   '/api/push': (await import('./api/push.js')).default,
   '/api/runner': (await import('./api/runner.js')).default,
   '/api/questions': (await import('./api/questions.js')).default,
+  '/api/settings': (await import('./api/settings.js')).default,
 };
 
 const TYPES = {

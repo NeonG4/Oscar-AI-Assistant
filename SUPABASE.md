@@ -187,6 +187,10 @@ later.
   Supabase staff, like any database host, have operational access to the
   underlying infrastructure.
 - If you ask Oscar something sensitive, it's in there.
+- With background catching on, the `people` table accumulates contact details
+  for people who never agreed to any of this. That is the one place where the
+  privacy question is not only about you, which is why the setting is off until
+  you turn it on.
 - There's no delete UI. Remove rows from the Supabase table editor, or:
   `delete from conversations where id = 123;`
 - To cap retention automatically, uncomment the `pg_cron` block at the bottom of
@@ -230,6 +234,44 @@ from plans p left join plan_steps s on s.plan_id = p.id
 where p.status = 'active'
 group by p.id order by p.due nulls last;
 ```
+
+---
+
+## People
+
+`db/schema.sql` also creates `people`, which is where Oscar keeps the people you
+know — how you know them, and how to reach them. Re-run the schema file after
+pulling any update; every statement is idempotent.
+
+Two ways in, and the difference matters:
+
+- **You ask.** "Olivia is my sister, add that to her contact information." Always
+  honoured, whatever the settings say.
+- **Oscar notices.** You mention Olivia in passing and she is filed anyway. This
+  is *background catching*, it is **off by default**, and you turn it on in
+  Settings → Remembering people.
+
+Only durable facts are recorded — who someone is to you, their email, where they
+work. Not how they are today. See the People section of `TOOLS.md` for the full
+set of rules.
+
+```sql
+-- Who Oscar knows about
+select name, relationship, emails, mentions, last_seen_at
+from people order by last_seen_at desc;
+
+-- What he worked out on his own, rather than being told
+select name, relationship, notes, created_at
+from people where source = 'background' order by created_at desc;
+
+-- Second thoughts: forget everything caught passively, keep everything you asked for
+delete from people where source = 'background';
+```
+
+This is the one table holding information about **other people**, which is not
+yours to leak. It gets the same RLS lockdown as everything else here, and the
+`source` column exists so you can always tell which facts you gave Oscar and
+which he inferred.
 
 ---
 

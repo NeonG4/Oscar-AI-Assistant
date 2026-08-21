@@ -90,6 +90,8 @@ const el = {
   setDetailed: $('set-detailed'),
   setModel: $('set-model'),
   setTiming: $('set-timing'),
+  setCatching: $('set-catching'),
+  catchingNote: $('catching-note'),
 
   recipe: $('recipe'),
   copy: $('copy'),
@@ -180,6 +182,86 @@ for (const [key, control] of [
     applySettings();
   });
 }
+
+/* =================================================== background catching */
+
+/**
+ * The one setting on this page that is not about this page.
+ *
+ * Everything above changes what you see and lives in localStorage. This one
+ * decides whether Oscar files away the people you mention, and it has to hold
+ * for a Shortcut on a phone and for a job running while this tab is closed —
+ * neither of which can read this browser's storage. So it is stored on the
+ * server and read back from it, which is why it arrives a moment after the rest
+ * of the pane rather than instantly.
+ *
+ * The checkbox starts DISABLED in the markup's spirit: it is only enabled once
+ * the server has said what the stored value actually is. A toggle you can flip
+ * before anyone knows its state is a toggle that lies to you for a second.
+ */
+let catchingOn = null;
+
+function sayCatching(text, state) {
+  el.catchingNote.textContent = text;
+  if (state) el.catchingNote.dataset.state = state;
+  else delete el.catchingNote.dataset.state;
+}
+
+function showCatching(on, note) {
+  catchingOn = on === true;
+  el.setCatching.checked = catchingOn;
+  sayCatching(
+    note ||
+      (catchingOn
+        ? 'On. People you mention are saved as you talk. Ask "who do I know" to see them, or "forget Olivia" to remove one.'
+        : 'Off. Nobody is recorded unless you ask — "Olivia is my sister, add that to her contact information" still works.')
+  );
+}
+
+async function loadCatching() {
+  el.setCatching.disabled = true;
+  try {
+    const { data } = await api('/api/settings');
+    if (!data || !data.ok) throw new Error(data && data.error);
+
+    showCatching(data.backgroundCatching);
+
+    // No database means there is nowhere to put a person even if one were
+    // caught, so the control is left disabled and says why. Better than
+    // accepting a click that silently does nothing.
+    if (!data.storable) {
+      sayCatching(
+        'No database is configured, so there is nowhere to keep people. This is fixed by OSCAR_BACKGROUND_CATCHING.'
+      );
+      return;
+    }
+
+    el.setCatching.disabled = false;
+  } catch (err) {
+    sayCatching(`Could not read this setting: ${(err && err.message) || err}`, 'bad');
+  }
+}
+
+el.setCatching.addEventListener('change', async () => {
+  const wanted = el.setCatching.checked;
+  const previous = catchingOn;
+
+  el.setCatching.disabled = true;
+  sayCatching('Saving…', 'saving');
+
+  try {
+    const { data } = await api('/api/settings', { backgroundCatching: wanted });
+    if (!data || !data.ok) throw new Error((data && data.error) || 'it was not saved');
+    showCatching(data.backgroundCatching);
+  } catch (err) {
+    // Put the checkbox back to what is actually stored. A control showing a
+    // setting the server never accepted is worse than an error message.
+    if (previous !== null) showCatching(previous);
+    sayCatching(`Not saved: ${(err && err.message) || err}`, 'bad');
+  } finally {
+    el.setCatching.disabled = false;
+  }
+});
 
 /* ============================================================== login gate */
 
@@ -358,6 +440,11 @@ async function enterConsole(email) {
   // Not awaited: notifications are a nicety, and a slow or failing push setup
   // must never hold up the console being usable.
   setupPush().catch(() => {});
+
+  // Read here rather than in init(), because /api/settings needs a session and
+  // the login screen has none. Not awaited either — the Settings tab is not
+  // what anyone opens the page for.
+  loadCatching().catch(() => {});
 
   // This one IS the greeting the whole feature exists for — a suspended run is
   // going nowhere until it is answered.
@@ -899,6 +986,32 @@ async function watchJob(jobId, token, reply) {
         lastMoved = Date.now();
       }
 
+      // Answered, but with tasks still open. Deliberately not dressed up as a
+      // finish: the list sitting above this is visibly unfinished, and printing
+      // "finished" over it is the whole problem.
+      if (job.status === 'incomplete') {
+        const list = job.tasks || [];
+        const ticked = list.filter((task) => task.done).length;
+
+        setActivity('bad', `stopped early · ${job.steps} steps`);
+        logLine('stopped early, with tasks still open', {
+          kind: 'bad',
+          how: `${ticked} of ${list.length} done`,
+        });
+        fillTurn(reply, {
+          text: job.answer || 'I stopped before finishing.',
+          detail: job.detail,
+          meta: [
+            { text: job.model || 'model', kind: 'model' },
+            { text: `${ticked} of ${list.length} tasks` },
+            { text: 'stopped early' },
+          ],
+        });
+        historyLoaded = false;
+        loadJobs({ quiet: true }).catch(() => {});
+        return stopWatching();
+      }
+
       if (job.status === 'done') {
         setActivity('done', `done · ${job.steps} steps`);
         logLine('finished', { kind: 'note', how: `${job.steps} steps` });
@@ -1115,6 +1228,10 @@ const STATUS_LABEL = {
   awaiting_confirm: 'needs a yes/no',
   awaiting_answer: 'needs an answer',
   done: 'done',
+  // Answered, but with tasks left open. Never labelled as a finish — the task
+  // list is right there on the card, and calling that "done" is what this
+  // status exists to stop.
+  incomplete: 'stopped early',
   failed: 'failed',
   cancelled: 'cancelled',
 };
@@ -1129,7 +1246,8 @@ function stopJobsPolling() {
 function jobNode(job) {
   const node = document.createElement('article');
   const active = ACTIVE_STATUSES.has(job.status);
-  node.className = `entry job${job.status === 'failed' ? ' bad' : ''}${active ? ' live' : ''}`;
+  const wrong = job.status === 'failed' || job.status === 'incomplete';
+  node.className = `entry job${wrong ? ' bad' : ''}${active ? ' live' : ''}`;
 
   const head = document.createElement('div');
   head.className = 'job-head';
@@ -1498,10 +1616,18 @@ async function openJob(job) {
 
     renderTasks(full.tasks || []);
     renderEvents(full.events || [], 0);
-    logLine(full.status === 'failed' ? full.error || 'failed' : 'finished', {
-      kind: full.status === 'failed' ? 'bad' : 'note',
-      how: `${full.steps || 0} steps`,
-    });
+    // Three outcomes, and the middle one is the reason this is not a boolean:
+    // a job that stopped with tasks open is reopened saying so, exactly as it
+    // did while it was being watched.
+    const broke = full.status === 'failed';
+    const stopped = full.status === 'incomplete';
+    logLine(
+      broke ? full.error || 'failed' : stopped ? 'stopped early, with tasks still open' : 'finished',
+      {
+        kind: broke || stopped ? 'bad' : 'note',
+        how: `${full.steps || 0} steps`,
+      }
+    );
 
     if (!job.conversationId) {
       addTurn('you', { text: full.question || '' });
@@ -1514,6 +1640,7 @@ async function openJob(job) {
           { text: formatWhen(full.createdAt || job.createdAt) },
           { text: full.model || '', kind: 'model' },
           { text: `${full.steps || 0} steps` },
+          ...(stopped ? [{ text: 'stopped early' }] : []),
         ],
       });
     }

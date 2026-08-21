@@ -21,6 +21,7 @@ import {
   isAwaitingAnswer,
   sanitizeHistory,
   AgentError,
+  MAX_EARLY_FINISH_NUDGES,
 } from '../lib/agent.js';
 import {
   createChallenge,
@@ -177,6 +178,32 @@ import confirmHandler from '../api/confirm.js';
 import historyHandler from '../api/history.js';
 import authHandler from '../api/auth.js';
 import sessionHandler from '../api/session.js';
+import {
+  cleanName,
+  findPerson,
+  forgetPerson,
+  listPeople,
+  mergePerson,
+  normalizePerson,
+  rememberPerson,
+  tidyPerson,
+  PersonError,
+} from '../lib/people.js';
+import { catchPeople, extractPeople, worthCatching } from '../lib/catch.js';
+import {
+  backgroundCatchingFromEnv,
+  clearBackgroundCatchingCache,
+  getBackgroundCatching,
+  normalizeBackgroundCatching,
+  setBackgroundCatching,
+  DEFAULT_BACKGROUND_CATCHING,
+} from '../lib/settings.js';
+import {
+  rememberPersonTool,
+  getPersonTool,
+  forgetPersonTool,
+  listPeopleTool,
+} from '../lib/tools/people.js';
 
 let passed = 0;
 async function test(name, fn) {
@@ -3334,6 +3361,92 @@ await test('a handoff is dispatched before the invocation that fired it returns'
   assert.equal(readJobToken(sent[0].body.token, { ...J_ENV }), 'job-7', 'each hop mints its own token');
 });
 
+/* --------------------------------------------------------------------------
+ *  FINISHING MEANS FINISHED
+ *
+ *  A run that writes an answer while its own task list still has open items is
+ *  not finished, and must never be recorded as though it were. The three tests
+ *  below cover the gate holding, the gate letting go honestly, and the whole
+ *  thing end to end through the job handler.
+ * ------------------------------------------------------------------------ */
+
+/** Plans two tasks and ticks off neither — the shape of the reported bug. */
+const PLAN_TWO_TASKS = {
+  role: 'assistant',
+  content: null,
+  tool_calls: [
+    {
+      id: 'call_plan',
+      type: 'function',
+      function: {
+        name: 'plan_tasks',
+        arguments: JSON.stringify({ tasks: ['Find both flights', 'Say which one wins'] }),
+      },
+    },
+  ],
+};
+
+await test('answering with a task still open sends the run back to work', async () => {
+  const env = { OPENAI_API_KEY: 'sk-test' };
+  const state = {
+    ...createAgentState({ question: "summarise Tony Stark's arc and save it" }, env),
+    tasks: [
+      { n: 1, title: 'Search Drive for existing documents', done: true },
+      { n: 2, title: 'Create a new Google Doc', done: false },
+    ],
+    round: 1,
+  };
+
+  const out = await runAgentStep(state, { env, fetchImpl: fakeOpenAIWithTools([FINAL]) });
+
+  assert.equal(out.status, 'working', 'an answer over an open task is not a finish');
+  assert.equal(out.state.refusals, 1);
+
+  const last = out.state.messages[out.state.messages.length - 1];
+  assert.equal(last.role, 'system');
+  assert.match(last.content, /Create a new Google Doc/, 'it is told exactly which task it owes');
+  assert.match(last.content, /finish_task/, 'and how to close out one it genuinely cannot do');
+});
+
+await test('a run that will not finish its tasks ends incomplete, not done', async () => {
+  const env = { OPENAI_API_KEY: 'sk-test' };
+  const state = {
+    ...createAgentState({ question: "summarise Tony Stark's arc and save it" }, env),
+    tasks: [{ n: 1, title: 'Create a new Google Doc', done: false }],
+    round: 4,
+    // Already sent back as often as it is going to be.
+    refusals: MAX_EARLY_FINISH_NUDGES,
+  };
+
+  const out = await runAgentStep(state, { env, fetchImpl: fakeOpenAIWithTools([FINAL]) });
+
+  assert.equal(out.status, 'done', 'the run has to end somewhere');
+  assert.equal(out.result.incomplete, true, 'but not as one that finished what it started');
+});
+
+await test('a job that stops with tasks open is recorded as incomplete', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  // Plans two tasks, ticks off neither, then answers — again and again.
+  const openai = fakeOpenAIWithTools([PLAN_TWO_TASKS, FINAL]);
+  globalThis.fetch = async (url, init) =>
+    String(url).includes('supabase') ? jobsDb(url, init) : openai(url, init);
+
+  const askRes = fakeRes();
+  await askHandler(fakeReq({ headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' } }), askRes);
+  const { jobId, jobToken } = askRes.json();
+
+  const stepRes = fakeRes();
+  await stepHandler(fakeReq({ url: '/api/step', body: { jobId, token: jobToken } }), stepRes);
+
+  assert.equal(stepRes.json().status, 'incomplete');
+
+  const stored = jobsDb.state.jobs[0];
+  assert.equal(stored.status, 'incomplete', 'never "done" over a list that is not');
+  assert.equal(stored.tasks.filter((t) => t.done).length, 0, 'and the open tasks are still open');
+});
+
 /* ==========================================================================
  *  RUNNING COMMANDS ON YOUR OWN MACHINE
  *
@@ -5365,5 +5478,736 @@ await test('with no database, the caller may supply the turns itself', async () 
   );
   assert.equal(sent[1].content, 'tallest building in Chicago');
 });
+
+/* ================================================================== people */
+section('people');
+
+/**
+ * Fake Supabase for the people table. Like fakePlansDb it actually stores
+ * rows — merging is the whole feature here, so a mock that only recorded calls
+ * would test nothing worth testing.
+ *
+ * The unique index on lower(name) is enforced too: without it a test could pass
+ * while the real database rejected the very same insert.
+ */
+function fakePeopleDb({ people = [], fail = false } = {}) {
+  const state = {
+    people: people.map((p, i) => ({
+      id: 10 + i,
+      mentions: 1,
+      source: 'explicit',
+      emails: [],
+      phones: [],
+      notes: [],
+      ...p,
+    })),
+    nextId: 100,
+  };
+  const calls = [];
+
+  const fn = async (url, init = {}) => {
+    const href = String(url);
+    const method = init.method || 'GET';
+    calls.push({ href, method });
+    if (fail) return { ok: false, status: 500, text: async () => 'boom' };
+
+    const path = href.split('/rest/v1/')[1] || '';
+    const [table, query = ''] = path.split('?');
+    const params = new URLSearchParams(query);
+    const body = init.body ? JSON.parse(init.body) : null;
+    const json = (data, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(data) });
+
+    if (table !== 'people') throw new Error(`unexpected table: ${table}`);
+
+    const idOf = () => Number((params.get('id') || '').replace('eq.', ''));
+
+    if (method === 'POST') {
+      const name = String(body.name || '').toLowerCase();
+      if (state.people.some((p) => String(p.name).toLowerCase() === name)) {
+        return {
+          ok: false,
+          status: 409,
+          text: async () => 'duplicate key value violates unique constraint (23505)',
+        };
+      }
+      const row = { id: state.nextId++, emails: [], phones: [], notes: [], mentions: 1, source: 'explicit', ...body };
+      state.people.push(row);
+      return json([row], 201);
+    }
+
+    if (method === 'PATCH') {
+      const id = idOf();
+      let updated = null;
+      state.people = state.people.map((p) => (p.id === id ? (updated = { ...p, ...body }) : p));
+      return json(updated ? [updated] : [], 200);
+    }
+
+    if (method === 'DELETE') {
+      const id = idOf();
+      state.people = state.people.filter((p) => p.id !== id);
+      return json(null, 204);
+    }
+
+    let rows = state.people;
+
+    const id = params.get('id');
+    if (id) rows = rows.filter((p) => p.id === Number(id.replace('eq.', '')));
+
+    // ilike with no wildcards is the exact, case-insensitive match the merge
+    // key relies on; with them it is a contains.
+    const name = params.get('name');
+    if (name) {
+      const raw = name.replace('ilike.', '');
+      const term = raw.replace(/\*/g, '').toLowerCase();
+      rows = raw.includes('*')
+        ? rows.filter((p) => String(p.name).toLowerCase().includes(term))
+        : rows.filter((p) => String(p.name).toLowerCase() === term);
+    }
+
+    const source = params.get('source');
+    if (source) rows = rows.filter((p) => p.source === source.replace('eq.', ''));
+
+    const or = params.get('or');
+    if (or) {
+      const terms = [...or.matchAll(/(\w+)\.ilike\.\*([^,)]*)\*/g)];
+      rows = rows.filter((p) =>
+        terms.some(([, field, term]) => String(p[field] || '').toLowerCase().includes(term.toLowerCase()))
+      );
+    }
+
+    return json(rows);
+  };
+
+  fn.calls = calls;
+  fn.state = state;
+  return fn;
+}
+
+const PEOPLE_ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
+
+/* ----------------------------------------------------------- tidying input */
+
+await test('a dictated name loses its trailing comma', () => {
+  assert.equal(cleanName('  Olivia,  '), 'Olivia');
+  assert.equal(cleanName('"Dr Ruiz".'), 'Dr Ruiz');
+});
+
+await test('prose is not an email address', () => {
+  const person = normalizePerson({ name: 'Dan', emails: ['dan@example.com', 'not an address', ''] });
+  assert.deepEqual(person.emails, ['dan@example.com']);
+});
+
+await test('the same phone number written two ways is stored once', () => {
+  const person = normalizePerson({ name: 'Dan', phones: ['(206) 555-0142', '2065550142'] });
+  assert.equal(person.phones.length, 1);
+  // The readable form is the one kept — a number you must reformat to dial is
+  // a number you will not use.
+  assert.equal(person.phones[0], '(206) 555-0142');
+});
+
+await test('a phone number needs enough digits to be one', () => {
+  const person = normalizePerson({ name: 'Dan', phones: ['12345'] });
+  assert.equal(person.phones, undefined);
+});
+
+await test('a stored person reads back without empty fields', () => {
+  const person = tidyPerson({ id: 1, name: 'Dan', emails: [], notes: [], relationship: null, mentions: 2 });
+  assert.equal('emails' in person, false);
+  assert.equal('relationship' in person, false);
+  assert.equal(person.mentions, 2);
+});
+
+/* ------------------------------------------------------------- the merging */
+
+await test('a background fact fills an empty field', () => {
+  const patch = mergePerson({ name: 'Olivia' }, { name: 'Olivia', relationship: 'sister' });
+  assert.equal(patch.relationship, 'sister');
+});
+
+await test('a background fact never overwrites one you gave yourself', () => {
+  const patch = mergePerson(
+    { name: 'Olivia', relationship: 'sister', company: 'Acme' },
+    { name: 'Olivia', relationship: 'cousin', company: 'Globex' }
+  );
+  assert.equal(patch.relationship, undefined);
+  assert.equal(patch.company, undefined);
+});
+
+await test('saying it yourself does overwrite', () => {
+  const patch = mergePerson(
+    { name: 'Olivia', relationship: 'sister' },
+    { name: 'Olivia', relationship: 'stepsister' },
+    { overwrite: true }
+  );
+  assert.equal(patch.relationship, 'stepsister');
+});
+
+await test('emails and phones are a union at every trust level', () => {
+  const patch = mergePerson({ name: 'Dan', emails: ['dan@work.com'] }, { name: 'Dan', emails: ['dan@home.com'] });
+  assert.deepEqual(patch.emails, ['dan@work.com', 'dan@home.com']);
+});
+
+await test('an email already on file is not added twice', () => {
+  const patch = mergePerson({ name: 'Dan', emails: ['dan@work.com'] }, { name: 'Dan', emails: ['DAN@WORK.COM'] });
+  assert.equal(patch.emails, undefined);
+});
+
+await test('notes accumulate, and duplicates do not', () => {
+  const patch = mergePerson(
+    { name: 'Dan', notes: ['allergic to shellfish'] },
+    { name: 'Dan', notes: ['Allergic to shellfish', 'plays five-a-side'] }
+  );
+  assert.deepEqual(patch.notes, ['allergic to shellfish', 'plays five-a-side']);
+});
+
+await test('the oldest notes fall off rather than new ones being refused', () => {
+  const existing = { name: 'Dan', notes: Array.from({ length: 20 }, (_, i) => `fact ${i}`) };
+  const patch = mergePerson(existing, { name: 'Dan', notes: ['the newest thing'] });
+  assert.equal(patch.notes.length, 20);
+  assert.equal(patch.notes.at(-1), 'the newest thing');
+  assert.equal(patch.notes.includes('fact 0'), false);
+});
+
+await test('a fuller name becomes the full name, not the handle', () => {
+  const patch = mergePerson({ name: 'Olivia' }, { name: 'Olivia Stall' });
+  assert.equal(patch.full_name, 'Olivia Stall');
+  assert.equal(patch.name, undefined);
+});
+
+await test('an unrelated longer name is not mistaken for a fuller one', () => {
+  const patch = mergePerson({ name: 'Olivia' }, { name: 'Daniel Ruiz' });
+  assert.equal(patch.full_name, undefined);
+});
+
+await test('every mention is counted, even one that taught nothing new', () => {
+  const patch = mergePerson(
+    { name: 'Olivia', relationship: 'sister', mentions: 3 },
+    { name: 'Olivia', relationship: 'sister' }
+  );
+  assert.equal(patch.mentions, 4);
+  assert.ok(patch.last_seen_at);
+});
+
+await test('confirming an inferred person promotes it to explicit', () => {
+  const patch = mergePerson({ name: 'Olivia', source: 'background' }, { name: 'Olivia' }, { overwrite: true });
+  assert.equal(patch.source, 'explicit');
+});
+
+await test('an explicit person is never demoted by a passing mention', () => {
+  const patch = mergePerson({ name: 'Olivia', source: 'explicit' }, { name: 'Olivia' });
+  assert.equal(patch.source, undefined);
+});
+
+/* ------------------------------------------------------------ storing them */
+
+await test('a new person is created with what was said', async () => {
+  const fetchImpl = fakePeopleDb();
+  const { person, created } = await rememberPerson(
+    { name: 'Olivia', relationship: 'sister' },
+    {},
+    { env: PEOPLE_ENV, fetchImpl }
+  );
+
+  assert.equal(created, true);
+  assert.equal(person.name, 'Olivia');
+  assert.equal(person.relationship, 'sister');
+  assert.equal(person.source, 'explicit');
+});
+
+await test('mentioning someone again merges rather than duplicating', async () => {
+  const fetchImpl = fakePeopleDb();
+  await rememberPerson({ name: 'Olivia', relationship: 'sister' }, {}, { env: PEOPLE_ENV, fetchImpl });
+  const { person, created } = await rememberPerson(
+    { name: 'olivia', emails: ['olivia@example.com'] },
+    {},
+    { env: PEOPLE_ENV, fetchImpl }
+  );
+
+  assert.equal(created, false);
+  assert.equal(fetchImpl.state.people.length, 1);
+  assert.equal(person.relationship, 'sister');
+  assert.deepEqual(person.emails, ['olivia@example.com']);
+  assert.equal(person.mentions, 2);
+});
+
+await test('a person needs a name', async () => {
+  await assert.rejects(
+    () => rememberPerson({ relationship: 'sister' }, {}, { env: PEOPLE_ENV, fetchImpl: fakePeopleDb() }),
+    PersonError
+  );
+});
+
+/* ------------------------------------------------------------ finding them */
+
+await test('someone is found by the name you say', async () => {
+  const fetchImpl = fakePeopleDb({ people: [{ name: 'Olivia', relationship: 'sister' }] });
+  const person = await findPerson('olivia', { env: PEOPLE_ENV, fetchImpl });
+  assert.equal(person.name, 'Olivia');
+});
+
+await test('"my sister" finds the sister', async () => {
+  const fetchImpl = fakePeopleDb({ people: [{ name: 'Olivia', relationship: 'sister' }] });
+  const person = await findPerson('my sister', { env: PEOPLE_ENV, fetchImpl });
+  assert.equal(person.name, 'Olivia');
+});
+
+await test('an ambiguous reference refuses and names the candidates', async () => {
+  const fetchImpl = fakePeopleDb({
+    people: [
+      { name: 'Sam', relationship: 'brother' },
+      { name: 'Alex', relationship: 'brother' },
+    ],
+  });
+  await assert.rejects(
+    () => findPerson('my brother', { env: PEOPLE_ENV, fetchImpl }),
+    (err) => err instanceof PersonError && /Sam/.test(err.message) && /Alex/.test(err.message)
+  );
+});
+
+await test('nobody matching says so rather than returning nothing', async () => {
+  const fetchImpl = fakePeopleDb();
+  await assert.rejects(() => findPerson('Olivia', { env: PEOPLE_ENV, fetchImpl }), PersonError);
+});
+
+await test('listing can be narrowed to what Oscar picked up on his own', async () => {
+  const fetchImpl = fakePeopleDb({
+    people: [
+      { name: 'Olivia', source: 'background' },
+      { name: 'Dan', source: 'explicit' },
+    ],
+  });
+  const caught = await listPeople({ source: 'background' }, { env: PEOPLE_ENV, fetchImpl });
+  assert.deepEqual(
+    caught.map((p) => p.name),
+    ['Olivia']
+  );
+});
+
+await test('where a fact came from is on every read', async () => {
+  const fetchImpl = fakePeopleDb({ people: [{ name: 'Olivia', source: 'background' }] });
+  const person = await findPerson('Olivia', { env: PEOPLE_ENV, fetchImpl });
+  assert.equal(person.source, 'background');
+});
+
+await test('forgetting someone removes them', async () => {
+  const fetchImpl = fakePeopleDb({ people: [{ name: 'Olivia' }] });
+  await forgetPerson(10, { env: PEOPLE_ENV, fetchImpl });
+  assert.equal(fetchImpl.state.people.length, 0);
+});
+
+/* ==================================================== background catching */
+section('background catching');
+
+await test('the cheap gate fires on a relationship', () => {
+  assert.equal(worthCatching("I'm writing to my sister, Olivia, who has a cold."), true);
+  assert.equal(worthCatching('Olivia is my sister'), true);
+  assert.equal(worthCatching('her boss said no'), true);
+});
+
+await test('the cheap gate fires on contact details', () => {
+  assert.equal(worthCatching('add olivia@example.com to the draft'), true);
+  assert.equal(worthCatching('call her on 206 555 0142'), true);
+  assert.equal(worthCatching('Dan works at Acme now'), true);
+});
+
+await test('the cheap gate stays out of the way of ordinary questions', () => {
+  assert.equal(worthCatching('what is the weather in Seattle'), false);
+  assert.equal(worthCatching('how long do I boil an egg'), false);
+  assert.equal(worthCatching('set a timer for ten minutes'), false);
+  assert.equal(worthCatching(''), false);
+});
+
+/** A fake OpenAI that answers the extraction call with whatever you hand it. */
+function fakeExtractor(people, { fail = false } = {}) {
+  return async () => {
+    if (fail) return { ok: false, status: 500, text: async () => 'boom' };
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ people }) } }] }),
+    };
+  };
+}
+
+await test('the extractor returns the people the model found', async () => {
+  const found = await extractPeople('my sister Olivia', {
+    env: { OPENAI_API_KEY: 'k' },
+    fetchImpl: fakeExtractor([{ name: 'Olivia', relationship: 'sister' }]),
+  });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].name, 'Olivia');
+});
+
+await test('a model that answers with nonsense yields nobody, not a crash', async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ choices: [{ message: { content: 'sorry, what?' } }] }),
+  });
+  const found = await extractPeople('my sister Olivia', { env: { OPENAI_API_KEY: 'k' }, fetchImpl });
+  assert.deepEqual(found, []);
+});
+
+await test('no api key means no extraction call at all', async () => {
+  let called = false;
+  const fetchImpl = async () => {
+    called = true;
+    throw new Error('should not be reached');
+  };
+  assert.deepEqual(await extractPeople('my sister Olivia', { env: {}, fetchImpl }), []);
+  assert.equal(called, false);
+});
+
+/**
+ * One fake standing in for both the model and the database, since a catch pass
+ * talks to each in turn. Which one a call is for is decided by its URL, the
+ * same way the real code decides.
+ */
+function fakeCatchWorld({ people = [], catching = true, found = [] } = {}) {
+  const db = fakePeopleDb({ people });
+  const extractor = fakeExtractor(found);
+  const calls = { model: 0, db: 0 };
+
+  const fn = async (url, init) => {
+    const href = String(url);
+    if (href.includes('openai')) {
+      calls.model += 1;
+      return extractor(href, init);
+    }
+    calls.db += 1;
+    if (href.includes('settings?')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([{ value: catching }]) };
+    }
+    return db(href, init);
+  };
+
+  fn.calls = calls;
+  fn.db = db;
+  return fn;
+}
+
+await test('with the setting off, nothing is caught and no model call is spent', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = fakeCatchWorld({ catching: false, found: [{ name: 'Olivia', relationship: 'sister' }] });
+
+  const result = await catchPeople(
+    { question: "I'm writing to my sister, Olivia, who has a cold." },
+    { env: { ...PEOPLE_ENV, OPENAI_API_KEY: 'k' }, fetchImpl }
+  );
+
+  assert.equal(result.skipped, 'off');
+  assert.deepEqual(result.caught, []);
+  assert.equal(fetchImpl.calls.model, 0);
+  assert.equal(fetchImpl.db.state.people.length, 0);
+});
+
+await test('with the setting on, a sister mentioned in passing is filed', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = fakeCatchWorld({ catching: true, found: [{ name: 'Olivia', relationship: 'sister' }] });
+
+  const result = await catchPeople(
+    { question: "I'm writing to my sister, Olivia, who has a cold. How should I talk to her?" },
+    { env: { ...PEOPLE_ENV, OPENAI_API_KEY: 'k' }, fetchImpl }
+  );
+
+  assert.deepEqual(result.caught, ['Olivia']);
+  const [saved] = fetchImpl.db.state.people;
+  assert.equal(saved.name, 'Olivia');
+  assert.equal(saved.relationship, 'sister');
+  // The rule the whole feature rests on: caught facts are labelled as caught.
+  assert.equal(saved.source, 'background');
+});
+
+await test('a question with nobody in it never reaches the model', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = fakeCatchWorld({ catching: true, found: [{ name: 'Olivia' }] });
+
+  const result = await catchPeople(
+    { question: 'what is the weather in Seattle' },
+    { env: { ...PEOPLE_ENV, OPENAI_API_KEY: 'k' }, fetchImpl }
+  );
+
+  assert.equal(result.skipped, 'no-signal');
+  assert.equal(fetchImpl.calls.model, 0);
+});
+
+await test('with no database, catching is skipped rather than attempted', async () => {
+  clearBackgroundCatchingCache();
+  const result = await catchPeople(
+    { question: 'my sister Olivia' },
+    { env: { OPENAI_API_KEY: 'k' }, fetchImpl: fakeCatchWorld() }
+  );
+  assert.equal(result.skipped, 'no-database');
+});
+
+await test('a catch that blows up returns rather than throwing', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = async (url) => {
+    if (String(url).includes('settings?')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify([{ value: true }]) };
+    }
+    throw new Error('the network is on fire');
+  };
+
+  const result = await catchPeople(
+    { question: 'my sister Olivia' },
+    { env: { ...PEOPLE_ENV, OPENAI_API_KEY: 'k' }, fetchImpl }
+  );
+
+  // The question has already been answered by the time this runs. An
+  // extraction failure must never become the user's problem.
+  assert.deepEqual(result.caught, []);
+  assert.ok(result.error);
+});
+
+await test('caught facts cannot overwrite what you said yourself', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = fakeCatchWorld({
+    people: [{ name: 'Olivia', relationship: 'sister', source: 'explicit' }],
+    catching: true,
+    found: [{ name: 'Olivia', relationship: 'cousin' }],
+  });
+
+  await catchPeople(
+    { question: 'my cousin Olivia rang' },
+    { env: { ...PEOPLE_ENV, OPENAI_API_KEY: 'k' }, fetchImpl }
+  );
+
+  const [saved] = fetchImpl.db.state.people;
+  assert.equal(saved.relationship, 'sister');
+  assert.equal(saved.source, 'explicit');
+});
+
+/* ------------------------------------------------------------- the setting */
+
+await test('background catching is off unless somebody turned it on', () => {
+  assert.equal(DEFAULT_BACKGROUND_CATCHING, false);
+  assert.equal(backgroundCatchingFromEnv({}), false);
+  assert.equal(backgroundCatchingFromEnv({ OSCAR_BACKGROUND_CATCHING: '1' }), true);
+  assert.equal(backgroundCatchingFromEnv({ OSCAR_BACKGROUND_CATCHING: 'nonsense' }), false);
+});
+
+await test('only a clear yes counts as yes', () => {
+  assert.equal(normalizeBackgroundCatching(true), true);
+  assert.equal(normalizeBackgroundCatching('true'), true);
+  assert.equal(normalizeBackgroundCatching('on'), true);
+  assert.equal(normalizeBackgroundCatching('maybe'), false);
+  assert.equal(normalizeBackgroundCatching(null), false);
+});
+
+await test('the stored setting is read back', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify([{ value: true }]) });
+  assert.equal(await getBackgroundCatching({ env: PEOPLE_ENV, fetchImpl }), true);
+});
+
+await test('an unreadable settings row means off, not on', async () => {
+  clearBackgroundCatchingCache();
+  const fetchImpl = async () => ({ ok: false, status: 500, text: async () => 'boom' });
+  assert.equal(await getBackgroundCatching({ env: PEOPLE_ENV, fetchImpl }), false);
+});
+
+await test('turning it off is saved as a real false', async () => {
+  clearBackgroundCatchingCache();
+  let written = null;
+  const fetchImpl = async (url, init) => {
+    written = JSON.parse(init.body);
+    return { ok: true, status: 201, text: async () => JSON.stringify([written]) };
+  };
+  assert.equal(await setBackgroundCatching(false, { env: PEOPLE_ENV, fetchImpl }), false);
+  assert.equal(written.value, false);
+  assert.equal(written.key, 'background_catching');
+});
+
+/* --------------------------------------------------------------- the tools */
+
+await test('the people tools are withheld without a database', () => {
+  const names = availableTools({ canWrite: true }, { OSCAR_ALLOW_WRITES: '1' }).map((t) => t.name);
+  assert.equal(names.includes('get_person'), false);
+  assert.equal(names.includes('remember_person'), false);
+});
+
+await test('reading people is offered without write authority; saving is not', () => {
+  const env = { ...PEOPLE_ENV, OSCAR_ALLOW_WRITES: '1' };
+  const names = availableTools({ canWrite: false }, env).map((t) => t.name);
+  assert.equal(names.includes('get_person'), true);
+  assert.equal(names.includes('list_people'), true);
+  assert.equal(names.includes('remember_person'), false);
+  assert.equal(names.includes('forget_person'), false);
+});
+
+await test('remember_person overwrites, because you said it out loud', async () => {
+  const fetchImpl = fakePeopleDb({ people: [{ name: 'Olivia', relationship: 'cousin', source: 'background' }] });
+  const result = await rememberPersonTool.run(
+    { name: 'Olivia', relationship: 'sister' },
+    { env: PEOPLE_ENV, fetchImpl }
+  );
+
+  assert.equal(result.person.relationship, 'sister');
+  assert.equal(result.person.source, 'explicit');
+  assert.match(result.confirmation, /Updated Olivia/);
+});
+
+await test('get_person answers the question you actually asked', async () => {
+  const fetchImpl = fakePeopleDb({
+    people: [{ name: 'Olivia', relationship: 'sister', emails: ['olivia@example.com'] }],
+  });
+  const person = await getPersonTool.run({ person: 'my sister' }, { env: PEOPLE_ENV, fetchImpl });
+  assert.deepEqual(person.emails, ['olivia@example.com']);
+});
+
+await test('list_people says so plainly when there is nobody', async () => {
+  const fetchImpl = fakePeopleDb();
+  const result = await listPeopleTool.run({}, { env: PEOPLE_ENV, fetchImpl });
+  assert.equal(result.count, 0);
+  assert.match(result.note, /Nobody saved yet/);
+});
+
+await test('forgetting someone names what is about to be lost', async () => {
+  const fetchImpl = fakePeopleDb({
+    people: [{ name: 'Olivia', relationship: 'sister', emails: ['a@b.com', 'c@d.com'] }],
+  });
+  const prompt = await forgetPersonTool.describe({ person: 'Olivia' }, { env: PEOPLE_ENV, fetchImpl });
+  assert.match(prompt, /Olivia \(sister\)/);
+  assert.match(prompt, /2 emails/);
+  // describe() must not have deleted anything.
+  assert.equal(fetchImpl.state.people.length, 1);
+});
+
+await test('forget_person asks before it does anything', () => {
+  assert.equal(needsConfirmation(forgetPersonTool, {}), true);
+  // Saving and reading are not worth a confirmation. One that fires on
+  // everything teaches you to tap yes without reading it.
+  assert.equal(needsConfirmation(rememberPersonTool, {}), false);
+  assert.equal(needsConfirmation(getPersonTool, {}), false);
+});
+
+
+/* ------------------------------------------- catching, wired into /api/ask */
+
+/**
+ * Everything one full ask touches at once: the agent's model call, the
+ * extraction call, the settings row, the people table and the conversation log.
+ *
+ * The two OpenAI calls are told apart by their system prompt rather than by
+ * call order, because the order is exactly the thing these tests should not be
+ * asserting — the catch is started in parallel with the agent, so which of them
+ * arrives first is a race and always will be.
+ */
+function fakeAskWorld({ answer = GOOD, found = [], catching = true } = {}) {
+  const people = fakePeopleDb();
+  const logged = [];
+  const json = (data, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(data) });
+
+  const fn = async (url, init = {}) => {
+    const href = String(url);
+
+    if (href.includes('openai')) {
+      const body = JSON.parse(init.body);
+      const system = String((body.messages[0] || {}).content || '');
+
+      if (system.startsWith('You extract durable facts')) {
+        fn.extractions += 1;
+        return json({ choices: [{ message: { content: JSON.stringify({ people: found }) } }] });
+      }
+
+      fn.answers += 1;
+      return json({ model: 'fake-model', usage: { total_tokens: 42 }, choices: [{ message: { content: answer } }] });
+    }
+
+    if (href.includes('settings?')) return json([{ value: catching }]);
+    if (href.includes('/people')) return people(href, init);
+
+    logged.push(init.body ? JSON.parse(init.body) : null);
+    return { ok: true, status: 201, text: async () => (init.method === 'GET' ? '[]' : '') };
+  };
+
+  fn.people = people;
+  fn.logged = logged;
+  fn.answers = 0;
+  fn.extractions = 0;
+  return fn;
+}
+
+await test('a sister mentioned in passing is filed by the time the answer goes out', async () => {
+  setEnv(DB_ENV);
+  clearBackgroundCatchingCache();
+  const world = fakeAskWorld({ found: [{ name: 'Olivia', relationship: 'sister' }] });
+  globalThis.fetch = world;
+
+  const res = fakeRes();
+  await askHandler(
+    fakeReq({
+      headers: { 'x-oscar-key': 'letmein' },
+      body: { question: "I'm writing to my sister, Olivia, who has a cold. How should I talk to her?" },
+    }),
+    res
+  );
+
+  // Awaited before the response leaves, not fired and forgotten — on serverless
+  // the function can be frozen the instant a response is sent.
+  assert.equal(world.people.state.people.length, 1);
+  assert.equal(world.people.state.people[0].name, 'Olivia');
+  assert.equal(world.people.state.people[0].relationship, 'sister');
+
+  // And none of it shows up in what the user actually gets back.
+  assert.equal(res.statusCode, 200);
+  assert.match(res.json().answer, /Six minutes/);
+});
+
+await test('turning the setting off turns the wiring off too', async () => {
+  setEnv(DB_ENV);
+  clearBackgroundCatchingCache();
+  const world = fakeAskWorld({ catching: false, found: [{ name: 'Olivia', relationship: 'sister' }] });
+  globalThis.fetch = world;
+
+  const res = fakeRes();
+  await askHandler(
+    fakeReq({
+      headers: { 'x-oscar-key': 'letmein' },
+      body: { question: "I'm writing to my sister, Olivia, who has a cold." },
+    }),
+    res
+  );
+
+  assert.equal(world.people.state.people.length, 0);
+  assert.equal(world.extractions, 0, 'a model call was spent with the setting off');
+  assert.equal(res.statusCode, 200);
+});
+
+await test('an ordinary question costs no extra model call', async () => {
+  setEnv(DB_ENV);
+  clearBackgroundCatchingCache();
+  const world = fakeAskWorld({ found: [{ name: 'Olivia' }] });
+  globalThis.fetch = world;
+
+  await askHandler(
+    fakeReq({ headers: { 'x-oscar-key': 'letmein' }, body: { question: 'how long do I boil an egg' } }),
+    fakeRes()
+  );
+
+  assert.equal(world.answers, 1);
+  assert.equal(world.extractions, 0);
+});
+
+await test('a catch that fails does not cost the user their answer', async () => {
+  setEnv(DB_ENV);
+  clearBackgroundCatchingCache();
+  const world = fakeAskWorld({ found: [{ name: 'Olivia', relationship: 'sister' }] });
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/people')) throw new Error('the people table is on fire');
+    return world(url, init);
+  };
+
+  const res = fakeRes();
+  await askHandler(
+    fakeReq({ headers: { 'x-oscar-key': 'letmein' }, body: { question: 'my sister Olivia is coming over' } }),
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.match(res.json().answer, /Six minutes/);
+});
+
 
 console.log(`\n${passed} passing${process.exitCode ? ' — WITH FAILURES' : ''}\n`);

@@ -162,7 +162,7 @@ export default async function handler(req, res) {
     // Terminal, or waiting on a human. Either way there is nothing to do, and
     // saying so plainly stops a caller from retrying in a loop.
     const parked = ['awaiting_confirm', 'awaiting_answer'];
-    if (['done', 'failed', 'cancelled', ...parked].includes(job.status)) {
+    if (['done', 'incomplete', 'failed', 'cancelled', ...parked].includes(job.status)) {
       return send(res, 200, { ok: true, status: job.status, finished: !parked.includes(job.status) });
     }
     if (!job.state) {
@@ -227,13 +227,20 @@ export default async function handler(req, res) {
       steps += 1;
 
       if (step.status === 'done') {
+        // 'done' is the agent's word for "this round produced an answer", which
+        // is not the same as the work being finished. markDone knows the
+        // difference; so must everything reported from here.
+        const finished = step.result.incomplete ? 'incomplete' : 'done';
+
         await markDone(jobId, step.result);
         await logTurn(job, { result: step.result });
         await announce(jobId, {
-          title: step.result.title || 'Oscar',
+          // A notification saying "Here's your summary" over a half-done task
+          // list is exactly the lie this is here to stop.
+          title: step.result.incomplete ? 'Stopped early' : step.result.title || 'Oscar',
           body: step.result.answer,
         });
-        return send(res, 200, { ok: true, status: 'done', steps, answer: step.result.answer });
+        return send(res, 200, { ok: true, status: finished, steps, answer: step.result.answer });
       }
 
       if (step.status === 'question') {

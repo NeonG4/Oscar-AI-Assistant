@@ -35,6 +35,7 @@ import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
 import { applyCors, readBody, send, HttpError, clientIp } from '../lib/http.js';
 import { logConversation, conversationRow, conversationTurns, isConfigured } from '../lib/db.js';
 import { createConfirmToken, CONFIRM_TTL_MS } from '../lib/confirm.js';
+import { catchPeople } from '../lib/catch.js';
 
 /**
  * Does this request have authority to change things — send mail, create events?
@@ -198,6 +199,12 @@ export default async function handler(req, res) {
   let source = null;
   let conversationId = null;
 
+  // Started as soon as there is a question, finished just before the response
+  // leaves. Declared out here so the catch block can wait for it too — a
+  // request that failed still contained whatever the user said about their
+  // sister, and that is worth keeping either way.
+  let catching = null;
+
   try {
     const url = new URL(req.url, 'http://localhost');
     const body = req.method === 'POST' ? await readBody(req) : {};
@@ -256,6 +263,17 @@ export default async function handler(req, res) {
     const writeAllowed = canWrite(req, via, body, url);
     const askFirst = requireConfirmation(via, body, process.env);
 
+    // ---- background catching ----------------------------------------------
+    // Kicked off here rather than after the answer, so its model call overlaps
+    // the agent's instead of being added to the end of it. Reading who was
+    // mentioned needs only the question, never the answer — see rule 1 in
+    // lib/catch.js — so there is nothing to wait for.
+    //
+    // Not awaited until just before the response goes out. On serverless the
+    // function can be frozen the moment a response is sent, which would lose
+    // the write; the same reason logConversation is awaited below.
+    catching = catchPeople({ question }, { env: process.env });
+
     // ---- how much machinery does this deserve? ----------------------------
     // A quick lookup answers inline in a couple of seconds. Real work becomes a
     // background job so it is not bounded by how long the caller will wait.
@@ -310,6 +328,13 @@ export default async function handler(req, res) {
       // forever because its first hop was dropped on the way out.
       await continueJob(job.id, { env: process.env });
 
+      // Caught here rather than when the job eventually finishes, because it is
+      // THIS request that holds what the user said — the job carries the
+      // question onward but the run itself produces no new statements of fact
+      // about anybody. Doing it here also means every route catches in exactly
+      // one place, so mentions cannot be counted twice.
+      await catching;
+
       const answer = wantsMission
         ? "I'll plan that out and work through it. You'll get a notification when it's done."
         : 'Working on that now. Open Oscar to watch, or check back shortly.';
@@ -339,18 +364,23 @@ export default async function handler(req, res) {
     // a response is sent, so a fire-and-forget insert would vanish some of the
     // time. ~50-150ms against a multi-second request is a fair price for a log
     // you can trust. lib/db.js no-ops when Supabase isn't configured.
-    await logConversation(
-      conversationRow({
-        question,
-        timeZone,
-        conversationId,
-        result,
-        status: 200,
-        via,
-        source,
-        totalMs: Date.now() - startedAt,
-      })
-    );
+    // Both writes at once: they are independent, and running them in sequence
+    // would add one round trip to every answer for no reason.
+    await Promise.all([
+      logConversation(
+        conversationRow({
+          question,
+          timeZone,
+          conversationId,
+          result,
+          status: 200,
+          via,
+          source,
+          totalMs: Date.now() - startedAt,
+        })
+      ),
+      catching,
+    ]);
 
     // A destructive action is waiting on a yes/no. Hand back a signed token
     // describing exactly what was proposed.
@@ -379,6 +409,9 @@ export default async function handler(req, res) {
       tools: result.toolsUsed,
       tasks: result.tasks,
       rounds: result.rounds,
+      // Answered, but with tasks still open. Told to the caller rather than
+      // left to be inferred from the list.
+      ...(result.incomplete ? { incomplete: true } : {}),
       async: false,
       mode: route.mode,
       routedBy: route.via,
@@ -411,6 +444,11 @@ export default async function handler(req, res) {
         })
       );
     }
+
+    // Whatever went wrong happened after the user spoke, so what they said is
+    // still true and still worth keeping. catchPeople never rejects, so this
+    // cannot turn one failure into two.
+    if (catching) await catching;
 
     return send(res, status, {
       ok: false,

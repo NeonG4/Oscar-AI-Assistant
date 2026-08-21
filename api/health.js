@@ -27,6 +27,7 @@ import { isPushConfigured, vapidKeys } from '../lib/push.js';
 import { MAX_MISSION_STEPS } from '../lib/missions.js';
 import { routerModels, isRoutingEnabled } from '../lib/router.js';
 import { selfUrl } from '../lib/jobs.js';
+import { backgroundCatchingFromEnv } from '../lib/settings.js';
 
 export default async function handler(req, res) {
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -110,6 +111,18 @@ export default async function handler(req, res) {
         plans: {
           // Plans live in Supabase, so they need the database, not Google.
           available: isConfigured(env),
+        },
+        people: {
+          // Contacts live in Supabase, like plans.
+          available: isConfigured(env),
+          // Whether Oscar records the people you mention without being asked.
+          // Reported because it is the one setting whose effect is invisible:
+          // with it off nothing errors, nothing is logged, and people simply
+          // never appear. The environment value only decides it when there is
+          // no database to store the real answer in.
+          backgroundCatching: isConfigured(env)
+            ? 'see /api/settings'
+            : backgroundCatchingFromEnv(env),
         },
         questions: {
           // Oscar pausing to ask you something needs somewhere to keep the

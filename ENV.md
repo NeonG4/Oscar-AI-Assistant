@@ -625,6 +625,34 @@ Set to `1` to stop offering tools to the model at all. Oscar goes back to
 answering purely from what the model knows. Useful for working out whether a bad
 answer is the tools' fault.
 
+### `OSCAR_BACKGROUND_CATCHING` — optional
+
+**Default:** unset, which means **off**.
+
+Whether Oscar quietly records the people you mention as you talk — names, how
+you know them, contact details — into the `people` table. See the People section
+of `TOOLS.md` for what does and does not get recorded.
+
+Almost nobody needs this variable. With Supabase configured the toggle in
+Settings → Remembering people is the real control, and it wins: this is only the
+fallback for a deployment with no database, where there is nowhere to store the
+setting *or* the people, so it does nothing useful on its own.
+
+Off by default on purpose. Everything this collects is information about other
+people, who are not the ones clicking the toggle, so it should be something you
+switched on rather than something you discovered had been happening.
+
+### `OSCAR_CATCH_MODEL` — optional
+
+**Default:** `OSCAR_FAST_MODEL`, then `OPENAI_MODEL`, then `gpt-4o-mini`.
+
+Which model reads your question for people worth remembering. It is a short
+extraction task with a capped reply, so the cheapest model you have is the right
+answer; there is no reason to point this at a strong one.
+
+Most questions never reach it at all — a keyword gate runs first, and "what's
+the weather" costs nothing.
+
 ### `OSCAR_DISABLE_REVERSE_GEOCODE` — optional
 
 Set to `1` to skip the coordinates → city name lookup, saving roughly 200–500ms

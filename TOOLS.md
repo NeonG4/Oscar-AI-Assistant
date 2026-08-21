@@ -274,6 +274,126 @@ There's no permanent-loss path that doesn't ask first.
 
 ---
 
+## People
+
+The people you know: who they are to you, and how to reach them. Like plans,
+this is data Oscar **owns**. Unlike plans — or anything else here — most of it
+is never explicitly given.
+
+```
+you:    "I'm writing to my sister, Olivia, who has a cold.
+         What's the best way to talk to her?"
+Oscar:  Keep it short and warm, ask how she's sleeping, and don't
+         offer advice unless she asks.
+
+        (Olivia is quietly filed as your sister. The cold is not.)
+
+you:    "what's my sister's email?"
+Oscar:  olivia@example.com.
+
+you:    "Olivia is my stepsister actually, fix that"
+Oscar:  Updated Olivia.
+```
+
+### Background catching
+
+The passive half. It is **off until you turn it on** — Settings → Remembering
+people, or `background_catching` in the `settings` table.
+
+With it on, every question you ask is read once more after it has been
+answered, and anything durable about a person is written to `people`. With it
+off, nothing is stored unless you ask for it, and `remember_person` still works
+exactly as it always did. That split is the whole design: a passing mention is
+governed by the toggle, a direct request never is.
+
+**Only what is still true in a year.** "My sister Olivia" is a fact. "Olivia has
+a cold" is not — it is true for a week and actively misleading afterwards, and
+an assistant that raises a cold from last March is worse than one that never
+listened. The person is still recorded from a sentence like that; the cold is
+what gets dropped. This is the rule a model is most likely to get wrong, so most
+of the extraction prompt in `lib/catch.js` is spent on it.
+
+**Only your words, never Oscar's.** The question is read; the answer is not.
+Generated prose contains invented details, and feeding those back into a table
+Oscar later treats as fact is how you end up with an address book full of things
+nobody ever said.
+
+**A caught fact can fill a gap, never overwrite one.** Everything from this path
+is stored with `source: 'background'`, and `mergePerson()` will let it complete
+an empty field but never replace a full one. So a misheard sentence can add
+something you can see and delete; it cannot quietly rewrite what you told him
+directly. Confirming an inferred fact yourself promotes the row to `explicit`,
+and it never travels back the other way.
+
+**Most questions never reach the model.** `worthCatching()` is a keyword gate in
+front of the extraction call — the same trick the router uses, for the same
+reason. "What's the weather" has no person in it and costs nothing. The gate is
+deliberately conservative in the cheap direction: it misses quiet mentions like
+"Tom moved to Denver", because a missed fact costs you one sentence to state
+explicitly while a model call on every timer costs money forever.
+
+**It never delays or breaks an answer.** The extraction call is started when the
+question arrives, so it overlaps the agent's own work rather than being added to
+the end of it, and every failure inside it is swallowed and logged. The question
+has already been answered by the time any of it matters.
+
+### Design decisions
+
+**One row per name, enforced by the database.** `name` is what you *call* them —
+"Olivia", not "Olivia Margaret Stall" — because that is the word you will say
+when you want her back. A unique index on `lower(name)` is what makes "add this
+to Olivia" a merge rather than a second Olivia, including when two mentions race
+each other. Genuinely two Olivias? The second gets a distinguishing name, which
+is what you would say out loud anyway once one Olivia was ambiguous.
+
+**People are addressed by name or by relationship.** `get_person` takes what you
+actually said, so both "Olivia" and "my sister" resolve. Ambiguity **refuses and
+names the candidates** rather than guessing — handing back the wrong brother's
+email address is the failure worth designing against.
+
+**Arrays for emails, phones and notes.** Learning a second address is new
+information, never a correction of the first, so those merge as a union at every
+trust level. Notes cap out at 20 with the *oldest* falling off, because what
+someone is doing now is worth more than what they were doing a year ago.
+
+**`birthday` is text, not a date.** "March 4th" is a real answer people give, and
+a date column would force Oscar to invent a year to store it.
+
+**Where a fact came from is on every read.** `source` comes back with every
+person, so "where did you get that?" is answerable without a second lookup, and
+a fact Oscar inferred is labelled as inferred every time it is repeated.
+
+**People tools are withheld without a database**, like plans — accepting a name
+and dropping it would be worse than having no people tools.
+
+**Reading is free, changing needs write permission.** `list_people` and
+`get_person` work from the read-only Shortcut; the other two need write
+authority. Background catching writes without any tool at all, which is exactly
+why it has its own switch rather than riding on `OSCAR_ALLOW_WRITES`.
+
+### Tools
+
+| Tool | Write? | What it does |
+| --- | :---: | --- |
+| `list_people` | | Everyone on file, most recently mentioned first |
+| `get_person` | | One person in full, by name or by relationship |
+| `remember_person` | ✅ | Save or update someone — **only when asked to** |
+| `forget_person` | ✅ | Deletes them and everything on file — asks first |
+
+`remember_person`'s description leans hard on that "only when asked to", and so
+does the system prompt. If the model filed away everyone it heard about, the
+setting would quietly stop meaning anything — which is a worse outcome than the
+feature simply being off.
+
+Changed your mind about the whole thing? This keeps everything you asked for and
+forgets everything Oscar worked out on his own:
+
+```sql
+delete from public.people where source = 'background';
+```
+
+---
+
 ## Tasks — Oscar showing his working
 
 Anything that takes more than one step gets a list first. Oscar calls
@@ -301,6 +421,19 @@ you: "compare the two flights and tell me which is better"
 permission — they edit a list that lives inside the run's own state, which is
 why they are available on a deployment with nothing configured at all. The list
 is thrown away with the run; it is a progress indicator, not a record.
+
+**A run cannot finish over an open task.** If the model writes a final answer
+while the list still has unticked items, the answer is refused rather than
+accepted: it is told which task it owes, reminded that a task which cannot be
+done is closed with `finish_task` and an honest note, and sent back to work.
+Only an empty list lets an answer through.
+
+That gate cannot be infinite, or a model determined to stop would spend the
+whole round budget being asked again. After three refusals — or once the rounds,
+the tool calls or the clock run out — the run ends and is recorded as
+`incomplete` rather than `done`. The notification says "Stopped early", the
+console says so, and the unfinished list stays on screen underneath. What none
+of them do is print "finished" over a list that plainly is not.
 
 **Numbering is assigned by the server, not the model.** `lib/tasklist.js`
 renumbers whatever list arrives from 1, and every `finish_task` result hands the

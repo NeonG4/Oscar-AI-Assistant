@@ -270,7 +270,10 @@ create table if not exists public.jobs (
   updated_at   timestamptz not null default now(),
   finished_at  timestamptz,
 
-  -- queued | running | awaiting_confirm | done | failed | cancelled
+  -- queued | running | awaiting_confirm | awaiting_answer
+  --   | done       — answered, with every task on its list ticked off
+  --   | incomplete — answered, but it stopped with tasks still open
+  --   | failed | cancelled
   status       text        not null default 'queued',
 
   question     text        not null,
@@ -521,3 +524,190 @@ alter table public.jobs add column if not exists question_id uuid;
 --   select j.id, q.question, q.created_at
 --   from public.jobs j join public.questions q on q.id = j.question_id
 --   where j.status = 'awaiting_answer';
+
+
+
+-- ============================================================================
+--  SETTINGS — the choices that have to be true everywhere
+--
+--  Most of Oscar's settings live in your browser, because they only change what
+--  the screen shows. This table is for the other kind: a choice that also has to
+--  hold for a Shortcut on your phone, for a job running on a server while you
+--  sleep, and for the laptop polling for commands. None of those can read
+--  localStorage, so the answer is written down here instead.
+--
+--  One row per setting, keyed by name. Today there are two:
+--
+--    confirm_level        "none" | "destructive" | "all"
+--                         how much Oscar asks before doing something. See
+--                         lib/settings.js for what each value means.
+--
+--    background_catching  true | false, and false unless you say otherwise
+--                         whether Oscar quietly records the people you mention
+--                         into `people` as you talk, rather than only when you
+--                         ask him to. Off by default because it collects
+--                         information about other people rather than about you,
+--                         and that should be a decision you made on purpose.
+--                         See lib/catch.js.
+--
+--  jsonb rather than text so the next setting can be an object without a
+--  migration. Reading it is on the critical path of every tool call, so the
+--  table is deliberately tiny and read by primary key.
+-- ============================================================================
+
+create table if not exists public.settings (
+  key        text        primary key,
+  value      jsonb       not null,
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.settings is
+  'Server-side preferences, keyed by name. Read by the API, the agent and the runner.';
+
+alter table public.settings enable row level security;
+revoke all on public.settings from anon, authenticated;
+
+-- What is Oscar currently set to ask about:
+--   select key, value, updated_at from public.settings;
+
+-- Set it from here rather than the website, if you would rather:
+--   insert into public.settings (key, value) values ('confirm_level', '"all"')
+--   on conflict (key) do update set value = excluded.value, updated_at = now();
+
+-- Turn passive contact-catching on without touching the website:
+--   insert into public.settings (key, value) values ('background_catching', 'true')
+--   on conflict (key) do update set value = excluded.value, updated_at = now();
+
+-- ============================================================================
+--  PEOPLE — the address book Oscar fills in himself
+--
+--  Everything else Oscar stores is something you asked him to store. This table
+--  is different: most of it arrives as a side effect of ordinary conversation.
+--  You say "I'm writing to my sister Olivia" because you want help writing to
+--  her, not because you wanted a contact record — and yet the useful thing to
+--  do with that sentence is remember that Olivia is your sister, so the next
+--  time you mention her Oscar already knows.
+--
+--  That behaviour is OFF until you turn it on. See the `background_catching`
+--  setting below. With it off this table still works perfectly well; it just
+--  only ever holds what you explicitly asked to be saved.
+--
+--  WHAT BELONGS IN HERE, AND WHAT VERY MUCH DOES NOT
+--
+--  Durable facts about a person: how you know them, how to reach them, where
+--  they work, when their birthday is. NOT how they are today. "Olivia has a
+--  cold" is true for a week and then actively misleading, and an assistant that
+--  brings up a cold from last March is worse than one that never listened.
+--  lib/catch.js is where that line is drawn and it is the most important rule
+--  in the feature.
+--
+--  ONE ROW PER NAME. `name` is what you actually call them — "Olivia", not
+--  "Olivia Margaret Stall" — because that is the word you will say when you
+--  want her back out again. The unique index below is what makes "add this to
+--  Olivia" a merge rather than a second Olivia, and it is enforced here rather
+--  than hoped for in application code, so two mentions racing each other cannot
+--  produce a duplicate. Genuinely two Olivias? The second one gets a
+--  distinguishing name — "Olivia Chen" — which is what you would say out loud
+--  anyway once one Olivia was ambiguous.
+-- ============================================================================
+
+create table if not exists public.people (
+  id           bigint generated always as identity primary key,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+
+  -- What you call them. The handle, not the legal name.
+  name         text        not null,
+  full_name    text,
+
+  -- "sister", "my boss at Acme", "friend from university". Free text on
+  -- purpose: an enum of relationships is a taxonomy nobody's actual life fits.
+  relationship text,
+
+  -- Arrays because people have a work address and a personal one, and because
+  -- learning a second phone number should not overwrite the first. Merged as a
+  -- union — see mergePerson() in lib/people.js.
+  emails       text[]      not null default '{}',
+  phones       text[]      not null default '{}',
+
+  -- Text, not date. "March 4th" and "the 12th of some month in summer" are both
+  -- real answers people give, and a date column would force Oscar to invent a
+  -- year in order to store either of them.
+  birthday     text,
+
+  company      text,
+  role         text,
+  location     text,
+
+  -- Everything else worth keeping, one fact per element. An array rather than a
+  -- paragraph so adding a fact is an append and de-duplicating is an equality
+  -- check, instead of string surgery on prose.
+  notes        text[]      not null default '{}',
+
+  -- ---- provenance --------------------------------------------------------
+  -- 'explicit'   you asked for this person to be saved.
+  -- 'background' Oscar picked them up from something you said in passing.
+  --
+  -- Worth a column because the two deserve different trust: a background fact
+  -- may fill a gap but may never overwrite something you stated directly, and
+  -- when you ask "where did that come from" the answer should exist. A row that
+  -- starts background and is later confirmed by you becomes explicit; it never
+  -- travels the other way.
+  source       text        not null default 'explicit',
+
+  -- How often they have come up, and when they last did. Cheap to maintain and
+  -- it is what makes "who do I talk about most" answerable later.
+  mentions     integer     not null default 1,
+  last_seen_at timestamptz not null default now()
+);
+
+comment on table public.people is
+  'People you know: how you know them, and how to reach them. Filled in explicitly, and passively when background catching is on.';
+
+-- The merge invariant, enforced by the database rather than by hope. Case
+-- folded because you will say "olivia" as often as "Olivia".
+create unique index if not exists people_name_key
+  on public.people (lower(name));
+
+-- "Who do I know" is read newest-mentioned first: the people currently in your
+-- life, not the ones you entered first.
+create index if not exists people_last_seen_idx
+  on public.people (last_seen_at desc);
+
+-- Fuzzy lookup for "my sister", "that guy at Acme". pg_trgm is already enabled
+-- further up this file for the history search.
+create index if not exists people_name_trgm_idx
+  on public.people using gin (name gin_trgm_ops);
+
+create index if not exists people_relationship_trgm_idx
+  on public.people using gin (relationship gin_trgm_ops);
+
+
+-- ---------------------------------------------------------------------------
+--  Row Level Security — same reasoning as every other table here, and with the
+--  sharpest edge of any of them. This is the only table that holds other
+--  people's contact details, which are not yours to leak. RLS on, no policies:
+--  the anon key gets nothing, and only the service role key that lives in your
+--  Vercel environment can read a single row.
+-- ---------------------------------------------------------------------------
+
+alter table public.people enable row level security;
+
+revoke all on public.people from anon, authenticated;
+
+
+-- ---------------------------------------------------------------------------
+--  Handy people queries
+-- ---------------------------------------------------------------------------
+
+-- Who Oscar knows about:
+--   select name, relationship, emails, mentions, last_seen_at
+--   from public.people order by last_seen_at desc;
+
+-- What was picked up passively rather than told to him directly:
+--   select name, relationship, notes, created_at from public.people
+--   where source = 'background' order by created_at desc;
+
+-- Second thoughts about background catching? This forgets everything it ever
+-- collected on its own, and keeps everything you asked for:
+--   delete from public.people where source = 'background';

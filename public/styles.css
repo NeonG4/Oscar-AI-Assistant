@@ -1124,3 +1124,18 @@ body[data-model="off"] .meta-model,
 body[data-timing="off"] .meta-timing {
   display: none;
 }
+
+/* --------------------------------------------------- server-side settings --
+   The note under a setting that is stored on the server rather than in this
+   browser. It has states the localStorage toggles never need: saving, because
+   there is a round trip, and bad, because the round trip can fail. Everything
+   else about it is an ordinary .meta line. */
+
+.choice-note[data-state='saving'] {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.choice-note[data-state='bad'] {
+  color: var(--bad);
+}

@@ -63,6 +63,11 @@ for an answer written to fit on a lock screen.
 | `lib/google/auth.js`    | OAuth refresh-token exchange and the Google API wrapper.               |
 | `lib/tools/plans.js`    | Your plans: goals broken into ordered steps you can tick off.          |
 | `lib/plans.js`          | Plan storage in Supabase. Owned data, not someone else's API.          |
+| `lib/tools/people.js`   | The people you know: save, look up, and forget one.                    |
+| `lib/people.js`         | People storage in Supabase, and the rules for merging into a person.   |
+| `lib/catch.js`          | Background catching: noticing the people you mention, without asking.  |
+| `lib/settings.js`       | Settings that must hold everywhere — the Shortcut, jobs, the laptop.   |
+| `api/settings.js`       | Read and change those settings. Session login only.                    |
 | `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
 | `lib/tools/shell.js`    | `run_cmd` / `check_cmd`: commands queued for your own computer.        |
 | `lib/commands.js`       | The command queue. Your laptop polls it; nothing ever calls in.        |
