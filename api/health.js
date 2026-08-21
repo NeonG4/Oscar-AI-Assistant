@@ -9,13 +9,19 @@
  * variable is set. It's opt-in because the page calls this endpoint on every
  * load and shouldn't pay for a database query each time.
  *
+ * Add `?google=1` for the same idea applied to Google: it asks Google which
+ * scopes the stored refresh token actually holds and whether each of the five
+ * APIs answers a request. A token minted before OSCAR_ALLOW_WRITES was turned
+ * on carries read-only scopes for good, and an API left switched off in Cloud
+ * Console fails only at call time — neither shows up in the booleans below.
+ *
  * Intentionally public: it reports booleans only, so it's still useful when you
  * are locked out and trying to work out why.
  */
 
 import { detectProvider } from '../lib/mailer.js';
 import { isConfigured, pingDatabase } from '../lib/db.js';
-import { isGoogleConfigured, canWriteGoogle } from '../lib/google/auth.js';
+import { isGoogleConfigured, canWriteGoogle, probeGoogle } from '../lib/google/auth.js';
 import { availableTools, isRunnerConfigured } from '../lib/tools/index.js';
 import { isPushConfigured, vapidKeys } from '../lib/push.js';
 import { MAX_MISSION_STEPS } from '../lib/missions.js';
@@ -33,6 +39,11 @@ export default async function handler(req, res) {
   const database = deep
     ? await pingDatabase()
     : { configured: isConfigured(env) };
+
+  // Same bargain as `deep`, for Google: opt-in because it costs six round trips
+  // to Google, and the page hits this endpoint on every load. See probeGoogle
+  // for why the env-var booleans below are not enough on their own.
+  const googleProbe = url.searchParams.get('google') === '1' ? await probeGoogle({ env }) : undefined;
 
   res.end(
     JSON.stringify(
@@ -60,6 +71,9 @@ export default async function handler(req, res) {
           writesEnabled: canWriteGoogle(env),
           writeSecretSet: Boolean(env.OSCAR_WRITE_SECRET),
           sendAllowlist: env.GOOGLE_SEND_ALLOWLIST ? 'set' : 'anyone',
+          // Only present with ?google=1. `connected` and `writesEnabled` above
+          // report what the environment says; this reports what Google says.
+          ...(googleProbe ? { probe: googleProbe } : {}),
         },
         confirmation: {
           // Which routes stop and ask before a destructive action.

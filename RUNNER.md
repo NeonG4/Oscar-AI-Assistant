@@ -44,13 +44,14 @@ one of those could in principle be wrong or compromised. The local check is the
 one that isn't reachable from any of them, which is precisely why the same check
 is done twice and why the second one is the one that counts.
 
-Three gates stand in front of any command:
+Four gates stand in front of any command:
 
 | Gate | Stops |
 | --- | --- |
 | `writes: true` on the tool | The read-only "Ask Oscar" Shortcut. A lost phone cannot run code on your machine. |
 | `confirm: true` on the tool | A misheard dictation. The command is read back before it runs. |
 | The runner's own policy | Everything else, on the machine itself. |
+| The confirmation gate | Destructive commands, by asking you on your phone. |
 
 And two limits you should know about:
 
@@ -60,13 +61,70 @@ And two limits you should know about:
 - The runner has exactly the privileges of the user who started it.
   **Do not run it as administrator.**
 
-### What the policy refuses
+### What stops to ask
+
+Between "fine" and "never" there is a third answer: **not without you.**
+
+Deleting a file, killing a process, installing a package, moving something,
+writing to the registry, `git reset --hard` — all legitimate things to want
+done, and all things you would rather not have happen because a dictation was
+misheard. Those stop, send a question to your phone, and run only if you say
+yes. Anything else is a no: silence is a no, a network failure is a no, and
+after five minutes an unanswered command is a no.
+
+You choose how much asks:
+
+| `--confirm` | What asks first |
+| --- | --- |
+| `destructive` (default) | The risky ones listed above |
+| `all` | Every single command |
+| `none` | Nothing. Only the denylist is left |
+
+The asking happens **on the laptop**, for the same reason the policy does. The
+server is asked to deliver the question and report the answer; the laptop
+decides what the answer means. A deployment that had been tampered with could
+refuse to ask you — in which case nothing runs — but it cannot manufacture a
+yes it was never given.
+
+> If push notifications are not set up, the question still appears on the
+> website and the runner prints a line saying nothing took the notification.
+> It is not silent, but it is much less useful, so set up push. See PUSH.md.
+
+### PowerShell is on the allowlist, and why that is not a hole
+
+The allowlist deliberately has no `sh`, `bash` or `cmd` on it: one shell makes
+the whole list decorative, because everything it refuses can be respelled as
+`sh -c "..."`. **PowerShell is an exception**, and the reason is that writing a
+file is the point of this feature — no other allowlisted program does it, and
+shell redirects (`echo x > file.js`) are split and refused.
+
+What keeps it honest is that the exception is paired with the gate. Destructive
+patterns are matched against the **whole command line**, including inside
+quotes, so `pwsh -c "Remove-Item build"` is seen and held exactly as bare
+`Remove-Item build` would be. Writing files is silent; deleting them asks.
+
+The honest limit: this catches destructive commands, not disguised ones.
+Someone who can queue commands and wants to hide one behind base64 or a
+variable will manage it. The gate is built against accident and
+overconfidence, which is the realistic failure, not against an attacker who
+already holds `OSCAR_RUNNER_SECRET`.
+
+Privilege escalators are the one thing with no middle setting. `sudo`, `su`,
+`doas` and `runas` are refused in every mode, at every `--confirm` level. There
+is no answer you could give that makes running Oscar as somebody else wise.
+
+### What the policy refuses outright
 
 Always, in every mode: recursive deletes of a filesystem root, `mkfs`/`fdisk`/
 `format`, raw writes to `/dev/`, shutdown and reboot, fork bombs, piping a
 download into a shell, disabling the firewall or antivirus, deleting user
-accounts, force-pushing `main`, and the `git` subcommands that throw work away
-(`reset --hard`, `clean -f`, `branch -D`).
+accounts, force-pushing `main`, and running as another user (`sudo`, `runas`).
+
+The `git` subcommands that throw work away — `reset --hard`, `clean -f`,
+`branch -D` — used to be here. They are now in the tier above: recoverable
+enough to be worth asking about rather than refusing, since wanting one of
+them is perfectly ordinary. Force-pushing `main` stayed here, because it is
+the one that takes other people's work with it.
 
 Chained commands are split and **every segment is checked** — `git status && rm
 -rf /` does not get through on the strength of its first word.
@@ -126,7 +184,8 @@ You should see:
 Oscar runner on YOUR-MACHINE
   deployment  https://your-app.vercel.app
   root        C:\Users\you\source\repos\Oscar
-  mode        allowlist (72 programs)
+  mode        allowlist (74 programs)
+  confirm     destructive commands ask first
 
 Waiting for commands. Ctrl-C to stop.
 ```
@@ -148,6 +207,8 @@ npm run runner -- --allow docker,psql  # add programs to the allowlist
 npm run runner -- --unrestricted       # anything except the denylist
 npm run runner -- --interval 5000      # poll less often
 npm run runner -- --once               # claim one command, then exit
+npm run runner -- --confirm all        # ask before every command
+npm run runner -- --confirm none       # never ask (denylist only)
 ```
 
 **Start with the default allowlist.** It already covers `git`, `node`, `npm`,
@@ -173,6 +234,9 @@ stays true. A single one of them would make the allowlist decorative.
 | Commands expire without running | The laptop was asleep. They only wait ten minutes, by design |
 | `"x" is not on the allowlist` | Add it with `--allow x`, or use `--unrestricted` |
 | Refused as outside the root | Pass a `cwd` inside `--root`, or start the runner with a wider `--root` |
+| A command sits at `HELD` and nothing happens | It is waiting for you. Answer it on the website, or set up push so it reaches your phone |
+| `NOT RUN — no answer within 5 minutes` | The question went unanswered. Ask again; raise `OSCAR_CONFIRM_TIMEOUT_MS` if five minutes is too short |
+| Everything asks, including `git status` | You started it with `--confirm all` |
 
 To watch what has been asked for:
 

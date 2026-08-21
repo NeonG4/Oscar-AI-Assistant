@@ -5,6 +5,12 @@
  *
  *   POST /api/runner  { action: 'claim',  runner }        -> the next command, or null
  *   POST /api/runner  { action: 'result', id, exitCode, stdout, stderr }
+ *   POST /api/runner  { action: 'confirm', id, why }     -> asks you, returns questionId
+ *   POST /api/runner  { action: 'confirm-status', questionId }
+ *
+ * The last two are the confirmation gate. The laptop decides a command needs
+ * your approval and uses them to have you asked; this endpoint carries the
+ * question out and the answer back, and judges neither.
  *
  * Your laptop calls this; this never calls your laptop. See lib/commands.js for
  * why the direction is inverted, and lib/shell-policy.js for what the laptop
@@ -37,6 +43,8 @@ import {
   isCommandsConfigured,
   CommandError,
 } from '../lib/commands.js';
+import { createQuestion, getQuestion, QuestionError } from '../lib/questions.js';
+import { notifyAll } from '../lib/push.js';
 
 function runnerSecret(env = process.env) {
   return (env.OSCAR_RUNNER_SECRET || '').trim();
@@ -113,10 +121,84 @@ export default async function handler(req, res) {
       return send(res, 200, { ok: true, id, status });
     }
 
+    /**
+     * The laptop has decided a command needs your say-so.
+     *
+     * Note the direction: the runner is telling the server to ask, not asking
+     * the server for permission. The verdict was reached on the laptop by
+     * lib/shell-policy.js and is not revisited here — this endpoint only
+     * carries the question to a device you are holding and carries the answer
+     * back. A compromised deployment can therefore refuse to ask (the command
+     * simply never runs) but cannot manufacture a yes it was not given.
+     */
+    if (action === 'confirm') {
+      const id = String(body.id || '').trim();
+      if (!id) return send(res, 400, { ok: false, error: 'No command id.' });
+
+      const command = await getCommand(id, {});
+
+      const question = await createQuestion(
+        {
+          question: `Run this on ${body.runner || 'your computer'}?\n\n${command.command}`,
+          // Two options, safest first, so the thumb rests on "no".
+          options: ['No, cancel it', 'Yes, run it'],
+          context: body.why ? `Flagged because it ${body.why}.` : undefined,
+        },
+        {}
+      );
+
+      // Awaited, not fired and forgotten: a serverless function stops existing
+      // the moment it responds, and an un-awaited push would never be sent.
+      const pushed = await notifyAll(
+        {
+          title: 'Oscar needs permission',
+          body: String(command.command).slice(0, 200),
+          // It is a question. It stays on screen until it is dealt with.
+          requireInteraction: true,
+          tag: `oscar-confirm-${id}`,
+          url: '/',
+        },
+        {}
+      );
+
+      return send(res, 200, {
+        ok: true,
+        questionId: question.id,
+        // The runner prints this. A gate nobody can see is worse than no gate:
+        // if push is unconfigured the command would otherwise sit there
+        // silently until it timed out, looking like a hang.
+        delivered: Boolean(pushed && pushed.sent),
+      });
+    }
+
+    /**
+     * Has it been answered yet? Polled by the runner while it waits.
+     *
+     * The answer is matched here rather than on the laptop only so that the
+     * runner stays dumb about wording; the laptop still makes the final call on
+     * whether to run, and treats anything that is not an explicit yes as a no.
+     */
+    if (action === 'confirm-status') {
+      const questionId = String(body.questionId || '').trim();
+      if (!questionId) return send(res, 400, { ok: false, error: 'No question id.' });
+
+      const question = await getQuestion(questionId, {});
+      const answered = question.status === 'answered';
+
+      return send(res, 200, {
+        ok: true,
+        status: question.status,
+        answered,
+        approved: answered ? /^\s*y/i.test(String(question.answer || '')) : false,
+        answer: question.answer,
+      });
+    }
+
     return send(res, 400, { ok: false, error: `Unknown action "${action}".` });
   } catch (err) {
-    const status = err instanceof CommandError ? err.status : 500;
-    const message = err instanceof CommandError ? err.message : 'The runner request failed.';
+    const known = err instanceof CommandError || err instanceof QuestionError;
+    const status = known ? err.status : 500;
+    const message = known ? err.message : 'The runner request failed.';
     console.error('[oscar] runner:', err);
     return send(res, status, { ok: false, error: message });
   }

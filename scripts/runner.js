@@ -27,13 +27,17 @@
  *     than where you were told is worse than failing.
  *   - Nothing runs with elevated privileges. If you started this as an ordinary
  *     user, that is all it can ever be. Do not run it as administrator.
+ *   - Commands that are recognisably destructive stop and ask you first, on
+ *     your phone, and run only on an explicit yes. Which ones ask is set by
+ *     --confirm; that the asking happens HERE rather than on the server is
+ *     what makes a yes impossible for the deployment to manufacture.
  */
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { checkCommand, DEFAULT_ALLOWED } from '../lib/shell-policy.js';
+import { classifyCommand, CONFIRM_MODES, DEFAULT_ALLOWED } from '../lib/shell-policy.js';
 
 /* --------------------------------------------------------------- .env.local */
 
@@ -61,6 +65,7 @@ function parseArgs(argv) {
     root: process.env.OSCAR_RUNNER_ROOT || process.cwd(),
     interval: Number(process.env.OSCAR_RUNNER_INTERVAL_MS) || 3000,
     allow: [...DEFAULT_ALLOWED],
+    confirm: process.env.OSCAR_RUNNER_CONFIRM || 'destructive',
     once: false,
   };
 
@@ -72,11 +77,22 @@ function parseArgs(argv) {
     else if (arg === '--once') opts.once = true;
     else if (arg === '--root') opts.root = valueOf() || opts.root;
     else if (arg === '--interval') opts.interval = Number(valueOf()) || opts.interval;
+    else if (arg === '--confirm') opts.confirm = valueOf() || opts.confirm;
     else if (arg === '--allow') opts.allow.push(...valueOf().split(',').map((s) => s.trim()).filter(Boolean));
     else if (arg === '--help' || arg === '-h') opts.help = true;
   }
 
   opts.root = path.resolve(opts.root.replace(/^~(?=$|[/\\])/, os.homedir()));
+
+  // An unrecognised value here would silently pick a policy you did not
+  // choose, so it stops rather than guessing.
+  if (!CONFIRM_MODES.includes(opts.confirm)) {
+    console.error(
+      `--confirm must be one of ${CONFIRM_MODES.join(", ")}, not "${opts.confirm}".`
+    );
+    process.exit(1);
+  }
+
   return opts;
 }
 
@@ -91,6 +107,10 @@ Oscar runner — lets Oscar run commands on this machine.
   npm run runner -- --root <dir>        confine commands to this tree
   npm run runner -- --allow docker,psql add programs to the allowlist
   npm run runner -- --interval 5000     how often to poll, in ms
+  npm run runner -- --confirm all       which commands ask before running:
+                                          destructive  the risky ones (default)
+                                          all          every single one
+                                          none         never ask
   npm run runner -- --once              claim at most one command, then exit
 
 Needs OSCAR_RUNNER_SECRET and OSCAR_BASE_URL, from the environment or .env.local.
@@ -113,6 +133,23 @@ if (!BASE) {
 const ENDPOINT = `${BASE}/api/runner`;
 const HOSTNAME = os.hostname();
 const MAX_OUTPUT = 20000;
+
+/** How the chosen confirm setting is described in the startup banner. */
+const CONFIRM_DESCRIPTION = {
+  destructive: 'destructive commands ask first',
+  all: 'every command asks first',
+  none: 'nothing asks — denylist only',
+};
+
+/**
+ * How long a held command waits for you, and how often it looks.
+ *
+ * Five minutes is chosen against the realistic case: you are holding the
+ * phone that just buzzed. Longer would leave a command hanging over a laptop
+ * you walked away from, and the safe outcome of silence is "no".
+ */
+const CONFIRM_TIMEOUT_MS = Number(process.env.OSCAR_CONFIRM_TIMEOUT_MS) || 5 * 60 * 1000;
+const CONFIRM_POLL_MS = 3000;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -164,6 +201,61 @@ function resolveCwd(requested) {
   }
   if (!fs.existsSync(target)) throw new Error(`No such directory: ${target}`);
   return target;
+}
+
+/* ------------------------------------------------------------ confirmation */
+
+/**
+ * Hold a command until you say yes.
+ *
+ * The server is asked to deliver the question and to report the answer, but
+ * it is this function that decides what the answer means, and the default at
+ * every exit is no. Silence is no. A network failure is no. An unreadable
+ * answer is no. That asymmetry is deliberate: the cost of a wrongly refused
+ * command is that you run it again, and the cost of a wrongly approved one is
+ * whatever the command does.
+ *
+ * Nothing else is claimed while this waits. One command at a time is the
+ * existing contract and holding to it means a queue cannot pile up behind a
+ * question you have not seen yet.
+ */
+async function askPermission(command, why) {
+  console.log(`           HELD — ${why}. Asking you.`);
+
+  let questionId;
+  try {
+    const asked = await post({ action: 'confirm', id: command.id, runner: HOSTNAME, why });
+    questionId = asked.questionId;
+    if (!asked.delivered) {
+      // Worth saying out loud. Otherwise this looks like a hang.
+      console.log('           no device took the notification — answer it on the website');
+    }
+  } catch (err) {
+    return { approved: false, why: `could not reach you to ask (${err.message})` };
+  }
+
+  const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(CONFIRM_POLL_MS);
+
+    let state;
+    try {
+      state = await post({ action: 'confirm-status', questionId });
+    } catch {
+      // A blip is not an answer. Keep waiting; the deadline still applies.
+      continue;
+    }
+
+    if (!state.answered) continue;
+    if (state.approved) return { approved: true };
+    return { approved: false, why: `you said no` };
+  }
+
+  return {
+    approved: false,
+    why: `no answer within ${Math.round(CONFIRM_TIMEOUT_MS / 60000)} minutes`,
+  };
 }
 
 /* --------------------------------------------------------------- execution */
@@ -229,11 +321,31 @@ async function handle(command) {
   if (command.reason) console.log(`           (${command.reason})`);
 
   // The local veto. Everything upstream is a request; this is the decision.
-  const verdict = checkCommand(command.command, { mode: opts.mode, allowed: opts.allow });
-  if (!verdict.ok) {
+  const verdict = classifyCommand(command.command, {
+    mode: opts.mode,
+    allowed: opts.allow,
+    confirm: opts.confirm,
+  });
+
+  if (verdict.verdict === 'refuse') {
     console.log(`           REFUSED — ${verdict.reason}`);
     await post({ action: 'result', id: command.id, status: 'refused', error: verdict.reason });
     return;
+  }
+
+  if (verdict.verdict === 'confirm') {
+    const permission = await askPermission(command, verdict.reason);
+    if (!permission.approved) {
+      console.log(`           NOT RUN — ${permission.why}`);
+      await post({
+        action: 'result',
+        id: command.id,
+        status: 'refused',
+        error: `Not run — ${permission.why}.`,
+      });
+      return;
+    }
+    console.log('           approved');
   }
 
   let cwd;
@@ -262,6 +374,13 @@ async function main() {
   console.log(
     `  mode        ${opts.mode}${opts.mode === 'allowlist' ? ` (${opts.allow.length} programs)` : ' — denylist only'}`
   );
+  console.log(`  confirm     ${CONFIRM_DESCRIPTION[opts.confirm]}`);
+  if (opts.confirm === 'none') {
+    console.log(
+      '\n  Nothing will ask before it runs. Only the denylist stands between a\n' +
+        '  mistaken command and your files.'
+    );
+  }
   console.log('\nWaiting for commands. Ctrl-C to stop.');
 
   let quiet = 0;

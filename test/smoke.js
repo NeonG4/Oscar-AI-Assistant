@@ -133,6 +133,9 @@ import {
   splitSegments,
   programOf,
   DEFAULT_ALLOWED,
+  classifyCommand,
+  CONFIRM_MODES,
+  NEVER_ALLOWED,
 } from '../lib/shell-policy.js';
 import {
   clampTimeout,
@@ -3395,11 +3398,34 @@ await test('an unknown program is refused in allowlist mode but fine unrestricte
   assert.equal(checkCommand('docker ps', { mode: 'allowlist', allowed: ['docker'] }).ok, true);
 });
 
-await test('git subcommands that discard work are refused even though git is allowed', () => {
-  for (const bad of ['git reset --hard HEAD~5', 'git clean -fd', 'git push origin main --force']) {
-    assert.equal(checkCommand(bad, { mode: 'unrestricted' }).ok, false, bad);
+await test('git subcommands that discard work stop and ask rather than running', () => {
+  for (const risky of ['git reset --hard HEAD~5', 'git clean -fd']) {
+    assert.equal(classifyCommand(risky, { mode: 'unrestricted' }).verdict, 'confirm', risky);
   }
-  assert.equal(checkCommand('git log --oneline -5', { mode: 'allowlist' }).ok, true);
+  // Force-pushing a main branch stays on the denylist: no answer makes it fine.
+  assert.equal(
+    classifyCommand('git push origin main --force', { mode: 'unrestricted' }).verdict,
+    'refuse'
+  );
+  assert.equal(classifyCommand('git log --oneline -5', { mode: 'allowlist' }).verdict, 'allow');
+});
+
+await test('force-pushing a main branch is refused however the flag is written', () => {
+  // Both orderings and both spellings. The old pattern only caught
+  // `--force` appearing before the branch name, which is not how it is
+  // usually typed; everything else reached the tier that a yes can unlock.
+  for (const never of [
+    'git push --force origin main',
+    'git push origin main --force',
+    'git push -f origin master',
+    'git push origin master -f',
+  ]) {
+    assert.equal(classifyCommand(never, { mode: 'unrestricted' }).verdict, 'refuse', never);
+  }
+
+  // A side branch is a different matter: recoverable, so it asks.
+  assert.equal(classifyCommand('git push -f origin spike', { mode: 'unrestricted' }).verdict, 'confirm');
+  assert.equal(classifyCommand('git push origin main', { mode: 'unrestricted' }).verdict, 'allow');
 });
 
 await test('the program name is read past paths, extensions and env prefixes', () => {
@@ -3414,16 +3440,98 @@ await test('segments split on every shell operator', () => {
   assert.deepEqual(splitSegments('  git status  '), ['git status']);
 });
 
+await test('operators inside quotes are left alone', () => {
+  // Needed once pwsh -c "..." is a legitimate command: splitting inside the
+  // quoted payload chopped one command into fragments that were then refused
+  // for not being program names.
+  assert.deepEqual(splitSegments('pwsh -c "a && b"'), ['pwsh -c "a && b"']);
+  assert.deepEqual(splitSegments('echo "x | y" | grep x'), ['echo "x | y"', 'grep x']);
+  // Still split outside them, which is what stops the chained-command bypass.
+  assert.deepEqual(splitSegments('git status && rm x'), ['git status', 'rm x']);
+});
+
 await test('an empty or oversized command is refused', () => {
   assert.equal(checkCommand('', { mode: 'unrestricted' }).ok, false);
   assert.equal(checkCommand('x'.repeat(5000), { mode: 'unrestricted' }).ok, false);
 });
 
-await test('the default allowlist has no shell or privilege escalator in it', () => {
-  // A single entry here would make the allowlist decorative.
-  for (const forbidden of ['sh', 'bash', 'zsh', 'powershell', 'pwsh', 'cmd', 'sudo', 'su', 'doas']) {
+await test('no privilege escalator is allowlisted, and none can be confirmed through', () => {
+  // PowerShell is now on the list; running as somebody else never will be.
+  // There is no answer you could give that makes this a good idea, so unlike
+  // the destructive tier it is refused rather than held.
+  for (const forbidden of NEVER_ALLOWED) {
+    assert.equal(DEFAULT_ALLOWED.includes(forbidden), false, `${forbidden} must not be allowlisted`);
+    for (const confirm of CONFIRM_MODES) {
+      assert.equal(
+        classifyCommand(`${forbidden} whoami`, { mode: 'unrestricted', confirm }).verdict,
+        'refuse',
+        `${forbidden} under confirm=${confirm}`
+      );
+    }
+  }
+});
+
+await test('the unix shells stay off the allowlist', () => {
+  // PowerShell earned an exception because writing files is the point of the
+  // feature. Nothing else has, and adding one without a reason would put the
+  // list back to being decorative.
+  for (const forbidden of ['sh', 'bash', 'zsh', 'ksh', 'fish', 'cmd']) {
     assert.equal(DEFAULT_ALLOWED.includes(forbidden), false, `${forbidden} must not be allowlisted`);
   }
+});
+
+await test('PowerShell is allowed to write files and held when it deletes them', () => {
+  // The whole reason pwsh is on the list: no other allowlisted program
+  // writes a source file without a shell redirect, and redirects are split
+  // and refused.
+  assert.equal(
+    classifyCommand('pwsh -c "Set-Content game.js -Value 1"', {}).verdict,
+    'allow'
+  );
+  assert.equal(classifyCommand('pwsh -c "Remove-Item game.js"', {}).verdict, 'confirm');
+});
+
+await test('a destructive command inside quotes is still seen', () => {
+  // The check that makes allowlisting a shell survivable: patterns are
+  // matched against the whole line, so wrapping does not hide anything.
+  assert.equal(classifyCommand('pwsh -c "Remove-Item -Recurse build"', {}).verdict, 'confirm');
+  assert.equal(classifyCommand('pwsh -Command "shutdown /s"', {}).verdict, 'refuse');
+});
+
+await test('the confirm setting decides what stops to ask', () => {
+  const harmless = 'git status';
+  const risky = 'pwsh -c "Remove-Item x"';
+
+  assert.equal(classifyCommand(harmless, { confirm: 'destructive' }).verdict, 'allow');
+  assert.equal(classifyCommand(risky, { confirm: 'destructive' }).verdict, 'confirm');
+
+  assert.equal(classifyCommand(harmless, { confirm: 'all' }).verdict, 'confirm');
+  assert.equal(classifyCommand(risky, { confirm: 'all' }).verdict, 'confirm');
+
+  assert.equal(classifyCommand(harmless, { confirm: 'none' }).verdict, 'allow');
+  assert.equal(classifyCommand(risky, { confirm: 'none' }).verdict, 'allow');
+});
+
+await test('the denylist cannot be confirmed through in any setting', () => {
+  // The line between "not without you" and "never". Everything in the
+  // destructive tier is reachable with a yes; nothing here is.
+  for (const confirm of CONFIRM_MODES) {
+    for (const never of ['rm -rf /', 'shutdown /s', 'mkfs.ext4 /dev/sda']) {
+      assert.equal(
+        classifyCommand(never, { mode: 'unrestricted', confirm }).verdict,
+        'refuse',
+        `${never} under confirm=${confirm}`
+      );
+    }
+  }
+});
+
+await test('an unknown confirm setting falls back to asking, not to running', () => {
+  // A typo in a flag must not be the thing that turns the gate off.
+  assert.equal(
+    classifyCommand('pwsh -c "Remove-Item x"', { confirm: 'sometimes' }).verdict,
+    'confirm'
+  );
 });
 
 section('the command queue');
