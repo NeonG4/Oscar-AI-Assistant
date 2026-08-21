@@ -223,9 +223,17 @@ export default async function handler(req, res) {
         // a failed job. `state` is still what it was before the round, and no
         // tool has run yet at that point, so the round simply happens again in
         // the next invocation with a full budget to do it in.
+        //
+        // A rate limit that swallowed the rest of the invocation is the same
+        // situation wearing a different status code. lib/backoff.js has already
+        // waited as long as this invocation could afford; running out while
+        // waiting means the next invocation should carry the round, not that
+        // the job failed. The clock check is what makes that safe — a 429 that
+        // came back instantly (no quota, bad billing) is nowhere near the
+        // deadline, so it still throws instead of handing off forever.
         if (
           err instanceof AgentError &&
-          err.status === 504 &&
+          (err.status === 504 || err.status === 429) &&
           Date.now() >= deadline - CHECKPOINT_HEADROOM_MS
         ) {
           break;

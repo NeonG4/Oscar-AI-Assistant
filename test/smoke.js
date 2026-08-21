@@ -210,6 +210,17 @@ import {
   forgetPersonTool,
   listPeopleTool,
 } from '../lib/tools/people.js';
+import {
+  backoffDelay,
+  errorDetail,
+  isPermanentQuotaError,
+  isRetryableStatus,
+  maxAttempts,
+  parseDuration,
+  postWithRetry,
+  providerRetryMs,
+  MAX_DELAY_MS,
+} from '../lib/backoff.js';
 
 let passed = 0;
 async function test(name, fn) {
@@ -6149,25 +6160,56 @@ await test('only a clear yes counts as yes', () => {
 
 section('the command policy');
 
-await test('the three states are the ones the settings page offers', () => {
-  assert.deepEqual(COMMAND_POLICIES, ['off', 'confirm', 'open']);
+await test('the four states are the ones the settings page offers', () => {
+  // `destructive` is here because this setting absorbed confirm_level and
+  // notification_level, which both had that tier and which command_policy
+  // originally did not. Losing it would have meant the website could only
+  // tell an unpinned runner to ask about everything, including `git status`.
+  assert.deepEqual(COMMAND_POLICIES, ['off', 'confirm', 'destructive', 'open']);
 });
 
-await test('an unset or unreadable policy asks rather than runs', () => {
-  // The direction of every fallback here. A missing row, a typo in the
-  // database and an unrecognised env var must all land on `confirm`: the
-  // failure that asks you a question, never the one that executes silently.
-  assert.equal(DEFAULT_COMMAND_POLICY, 'confirm');
-  assert.equal(commandPolicyFromEnv({}), 'confirm');
-  assert.equal(normalizeCommandPolicy('nonsense'), 'confirm');
-  assert.equal(normalizeCommandPolicy(''), 'confirm');
-  assert.equal(normalizeCommandPolicy(null), 'confirm');
-  assert.equal(normalizeCommandPolicy(undefined), 'confirm');
+await test('every fallback lands on destructive, and never on open', () => {
+  // The direction that matters. A missing row, a typo in the database and an
+  // unrecognised environment variable must not be the thing that lets
+  // commands run unattended.
+  assert.equal(DEFAULT_COMMAND_POLICY, 'destructive');
 
-  // And the two deliberate answers still get through.
-  assert.equal(normalizeCommandPolicy('off'), 'off');
-  assert.equal(normalizeCommandPolicy(' OPEN '), 'open');
-  assert.equal(commandPolicyFromEnv({ OSCAR_COMMAND_POLICY: 'off' }), 'off');
+  for (const bad of [undefined, null, '', 'nonsense', 'OPEN SESAME', 42, {}]) {
+    assert.equal(
+      normalizeCommandPolicy(bad),
+      'destructive',
+      `${JSON.stringify(bad)} must fall back to destructive`
+    );
+  }
+  assert.equal(commandPolicyFromEnv({}), 'destructive');
+  assert.equal(commandPolicyFromEnv({ OSCAR_COMMAND_POLICY: 'nonsense' }), 'destructive');
+});
+
+await test('a deliberate choice is honoured, whitespace and case included', () => {
+  for (const policy of COMMAND_POLICIES) {
+    assert.equal(normalizeCommandPolicy(policy), policy);
+    assert.equal(normalizeCommandPolicy(` ${policy.toUpperCase()} `), policy);
+    assert.equal(commandPolicyFromEnv({ OSCAR_COMMAND_POLICY: policy }), policy);
+  }
+});
+
+await test('the settings nothing ever read are gone', async () => {
+  // confirm_level and notification_level were written to the database and
+  // read back only by the settings endpoint itself — a dropdown that
+  // remembered your choice while nothing in the system consulted it. They
+  // were folded into command_policy; this stops one reappearing by accident.
+  const settings = await import('../lib/settings.js');
+  for (const gone of [
+    'getConfirmLevel',
+    'setConfirmLevel',
+    'CONFIRM_LEVELS',
+    'levelRequiresConfirmation',
+    'getNotificationLevel',
+    'setNotificationLevel',
+    'NOTIFICATION_LEVELS',
+  ]) {
+    assert.equal(settings[gone], undefined, `${gone} should no longer exist`);
+  }
 });
 
 await test('the stored setting is read back', async () => {
@@ -6382,6 +6424,261 @@ await test('a catch that fails does not cost the user their answer', async () =>
 
   assert.equal(res.statusCode, 200);
   assert.match(res.json().answer, /Six minutes/);
+});
+
+
+
+/* --------------------------------------------------------------- backoff */
+
+section('rate limits');
+
+/** A provider that fails the first `failures` calls, then answers. */
+function flakyOpenAI(failures, { status = 429, body, headers } = {}) {
+  const calls = [];
+  const fn = async (url, init) => {
+    calls.push({ url, init });
+    if (calls.length <= failures) {
+      return {
+        ok: false,
+        status,
+        headers,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message:
+                body ||
+                'Rate limit reached for gpt-4o in organization org-abc on tokens per min ' +
+                  '(TPM): Limit 30000, Used 28935, Requested 2033. Please try again in 1.936s.',
+            },
+          }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          model: 'fake-model',
+          usage: {},
+          choices: [{ message: { content: JSON.stringify({ title: 'Ok', answer: 'Six minutes.' }) } }],
+        }),
+    };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+/** Records what it was asked to wait for instead of actually waiting. */
+function fakeSleep() {
+  const waits = [];
+  const fn = async (ms) => {
+    waits.push(ms);
+  };
+  fn.waits = waits;
+  return fn;
+}
+
+await test('durations are parsed in every shape the provider sends them', () => {
+  assert.equal(parseDuration('1.936s'), 1936);
+  assert.equal(parseDuration('300ms'), 300);
+  assert.equal(parseDuration('6m0s'), 360000);
+  assert.equal(parseDuration('1m30s'), 90000);
+  // A bare Retry-After is seconds.
+  assert.equal(parseDuration('2'), 2000);
+  assert.equal(parseDuration(''), null);
+  assert.equal(parseDuration(undefined), null);
+});
+
+await test('the wait is read out of the error message when no header carries it', () => {
+  const detail =
+    'Rate limit reached for gpt-4o in organization org-abc on tokens per min (TPM): ' +
+    'Limit 30000, Used 28935, Requested 2033. Please try again in 1.936s.';
+  assert.equal(providerRetryMs({}, detail), 1936);
+});
+
+await test('headers beat the message, and the most specific header wins', () => {
+  const res = { headers: { 'retry-after-ms': '400', 'retry-after': '9' } };
+  assert.equal(providerRetryMs(res, 'try again in 30s'), 400);
+  assert.equal(providerRetryMs({ headers: { 'retry-after': '3' } }, ''), 3000);
+  assert.equal(providerRetryMs({ headers: { 'x-ratelimit-reset-tokens': '2s' } }, ''), 2000);
+});
+
+await test('a real Headers object reads the same as a plain one', () => {
+  const res = { headers: new Headers({ 'retry-after-ms': '750' }) };
+  assert.equal(providerRetryMs(res, ''), 750);
+});
+
+await test('the provider is believed, with a small pad, and capped', () => {
+  assert.equal(backoffDelay(1, { res: {}, detail: 'try again in 1.936s' }), 2186);
+  // A reset ten minutes away is not worth holding a request open for.
+  assert.equal(backoffDelay(1, { res: { headers: { 'retry-after': '600' } } }), MAX_DELAY_MS);
+});
+
+await test('with nothing to go on the delay backs off and stays jittered', () => {
+  const first = backoffDelay(1, { random: () => 1 });
+  const second = backoffDelay(2, { random: () => 1 });
+  const third = backoffDelay(3, { random: () => 1 });
+  assert.ok(second > first && third > second);
+  // Jitter genuinely moves it, and never to zero.
+  assert.ok(backoffDelay(3, { random: () => 0 }) > 0);
+  assert.ok(backoffDelay(3, { random: () => 0 }) < third);
+});
+
+await test('only the transient statuses are retried', () => {
+  assert.equal(isRetryableStatus(429), true);
+  assert.equal(isRetryableStatus(503), true);
+  assert.equal(isRetryableStatus(400), false);
+  assert.equal(isRetryableStatus(401), false);
+  assert.equal(isRetryableStatus(404), false);
+});
+
+await test('a quota failure is told apart from a rate limit', () => {
+  assert.equal(isPermanentQuotaError('insufficient_quota'), true);
+  assert.equal(isPermanentQuotaError('You exceeded your current quota'), true);
+  assert.equal(isPermanentQuotaError('Rate limit reached for gpt-4o ... try again in 2s'), false);
+});
+
+await test('errorDetail digs the message out, and survives a body that is not JSON', () => {
+  assert.equal(errorDetail('{"error":{"message":"boom"}}'), 'boom');
+  assert.equal(errorDetail('<html>502</html>'), '<html>502</html>');
+});
+
+await test('a rate-limited call is retried and succeeds', async () => {
+  const doFetch = flakyOpenAI(1);
+  const sleep = fakeSleep();
+
+  const { res, attempts } = await postWithRetry(
+    doFetch,
+    'https://x',
+    { method: 'POST' },
+    { budgetMs: 45000, attempts: 3, sleep }
+  );
+
+  assert.equal(res.ok, true);
+  assert.equal(attempts, 2);
+  assert.equal(doFetch.calls.length, 2);
+  // It waited what the message asked for, not a guess.
+  assert.deepEqual(sleep.waits, [2186]);
+});
+
+await test('retrying gives up at the attempt cap rather than forever', async () => {
+  const doFetch = flakyOpenAI(99);
+  const sleep = fakeSleep();
+
+  const { res, attempts } = await postWithRetry(doFetch, 'https://x', {}, {
+    budgetMs: 45000,
+    attempts: 3,
+    sleep,
+  });
+
+  assert.equal(res.status, 429);
+  assert.equal(attempts, 3);
+  assert.deepEqual(sleep.waits, [2186, 2186]);
+});
+
+await test('a quota failure is not slept on at all', async () => {
+  const doFetch = flakyOpenAI(99, { body: 'insufficient_quota: check your billing' });
+  const sleep = fakeSleep();
+
+  const { attempts } = await postWithRetry(doFetch, 'https://x', {}, {
+    budgetMs: 45000,
+    attempts: 3,
+    sleep,
+  });
+
+  assert.equal(attempts, 1);
+  assert.deepEqual(sleep.waits, []);
+});
+
+await test('a wrong request is returned immediately, not retried', async () => {
+  const doFetch = flakyOpenAI(99, { status: 400, body: 'unknown model' });
+  const { attempts } = await postWithRetry(doFetch, 'https://x', {}, { budgetMs: 45000, attempts: 3 });
+  assert.equal(attempts, 1);
+});
+
+await test('a wait longer than the budget is not started', async () => {
+  const doFetch = flakyOpenAI(99, { body: 'Please try again in 20s.' });
+  const sleep = fakeSleep();
+
+  const { res, attempts } = await postWithRetry(doFetch, 'https://x', {}, {
+    budgetMs: 6000,
+    attempts: 3,
+    sleep,
+  });
+
+  // Better a fast 429 the caller can fall back from than a request held open
+  // past the deadline it was given.
+  assert.equal(res.status, 429);
+  assert.equal(attempts, 1);
+  assert.deepEqual(sleep.waits, []);
+});
+
+await test('the attempt count is env-tunable, and nonsense falls back', () => {
+  assert.equal(maxAttempts({}), 3);
+  assert.equal(maxAttempts({ OSCAR_OPENAI_MAX_ATTEMPTS: '5' }), 5);
+  assert.equal(maxAttempts({ OSCAR_OPENAI_MAX_ATTEMPTS: '0' }), 3);
+  assert.equal(maxAttempts({ OSCAR_OPENAI_MAX_ATTEMPTS: 'lots' }), 3);
+  // A typo cannot make one question hold the function open all day.
+  assert.equal(maxAttempts({ OSCAR_OPENAI_MAX_ATTEMPTS: '99' }), 6);
+});
+
+await test('askAgent rides out a rate limit instead of failing the question', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(init);
+    if (calls.length === 1) {
+      return {
+        ok: false,
+        status: 429,
+        headers: { 'retry-after-ms': '900' },
+        text: async () => JSON.stringify({ error: { message: 'Rate limit reached for gpt-4o.' } }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          model: 'gpt-4o',
+          usage: { total_tokens: 10 },
+          choices: [
+            { message: { content: JSON.stringify({ title: 'Egg', answer: 'Six minutes.' }) } },
+          ],
+        }),
+    };
+  };
+  const sleep = fakeSleep();
+
+  const result = await askAgent(
+    { question: 'how long to boil an egg' },
+    { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl, sleep }
+  );
+
+  assert.equal(result.answer, 'Six minutes.');
+  assert.deepEqual(sleep.waits, [1150]);
+});
+
+await test('a rate limit that outlasts the retries still surfaces as a 429', async () => {
+  await assert.rejects(
+    () =>
+      askAgent(
+        { question: 'hi' },
+        { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: flakyOpenAI(99), sleep: fakeSleep() }
+      ),
+    (err) => err.status === 429 && /rate limited/i.test(err.message)
+  );
+});
+
+await test('a dead account fails fast and says which kind of 429 it is', async () => {
+  const doFetch = flakyOpenAI(99, { body: 'insufficient_quota' });
+  const sleep = fakeSleep();
+
+  await assert.rejects(
+    () =>
+      askAgent({ question: 'hi' }, { env: { OPENAI_API_KEY: 'sk-test' }, fetchImpl: doFetch, sleep }),
+    (err) => err.status === 429 && /out of quota/i.test(err.message)
+  );
+  assert.deepEqual(sleep.waits, []);
 });
 
 

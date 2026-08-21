@@ -538,19 +538,22 @@ alter table public.jobs add column if not exists question_id uuid;
 --
 --  One row per setting, keyed by name:
 --
---    command_policy       "off" | "confirm" | "open"
+--    command_policy       "off" | "confirm" | "destructive" | "open"
 --                         whether Oscar may run commands on your computer at
 --                         all, and whether each one asks first. Read by the
 --                         shell tool before queueing and by /api/runner on
 --                         every claim, so changing it takes effect within a
 --                         few seconds without restarting the runner.
---                         Defaults to "confirm", and every failure path lands
---                         there too: an unreadable answer must not be the
---                         thing that lets commands run unattended.
+--                         Defaults to "destructive", and every failure path
+--                         lands there too: an unreadable answer must not be
+--                         the thing that lets commands run unattended.
 --
---    confirm_level        "none" | "destructive" | "all"
---                         how much Oscar asks before doing something. See
---                         lib/settings.js for what each value means.
+--                         This absorbed two earlier settings on 2026-08-21,
+--                         `confirm_level` and `notification_level`, which
+--                         asked the same question and were read by nothing.
+--                         Old rows for either key are simply ignored; delete
+--                         them with the statement at the bottom if you like a
+--                         tidy table.
 --
 --    background_catching  true | false, and false unless you say otherwise
 --                         whether Oscar quietly records the people you mention
@@ -585,8 +588,12 @@ revoke all on public.settings from anon, authenticated;
 --   on conflict (key) do update set value = excluded.value, updated_at = now();
 
 -- Set it from here rather than the website, if you would rather:
---   insert into public.settings (key, value) values ('confirm_level', '"all"')
+--   insert into public.settings (key, value) values ('command_policy', '"open"')
 --   on conflict (key) do update set value = excluded.value, updated_at = now();
+
+-- Clear out the two settings that were folded into command_policy. Optional:
+-- nothing reads them, so leaving them costs two rows and no behaviour.
+--   delete from public.settings where key in ('confirm_level', 'notification_level');
 
 -- Turn passive contact-catching on without touching the website:
 --   insert into public.settings (key, value) values ('background_catching', 'true')

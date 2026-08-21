@@ -3,8 +3,8 @@
  * ----------------------------------------------------------------------------
  * The settings that are not local to a browser.
  *
- *   GET  /api/settings                             -> { confirmLevel, levels, … }
- *   POST /api/settings { confirmLevel: 'all' }      -> save it
+ *   GET  /api/settings                              -> { commandPolicy, … }
+ *   POST /api/settings { commandPolicy: 'open' }    -> save it
  *   POST /api/settings { backgroundCatching: true } -> save that instead
  *
  * A POST sets whichever settings it names and leaves the rest alone, so the
@@ -16,28 +16,21 @@
  *
  * AUTH IS SESSION-ONLY, the same rule as /api/history, /api/push and
  * /api/questions, and for a sharper reason than any of them. This value decides
- * whether Oscar stops to ask before deleting mail or running a command, so
- * writing it is the single most security-relevant thing a request can do
- * without doing anything itself. The Shortcut key sits in plain text on a
- * phone; it can ask questions, and it may not quietly turn the safety off.
+ * whether a machine you own will execute what a model asked for, and whether
+ * it stops to ask first, so writing it is the single most security-relevant
+ * thing a request can do without doing anything itself. The Shortcut key sits
+ * in plain text on a phone; it can ask questions, and it may not quietly turn
+ * the safety off.
  *
  * The runner needs this value too and has no session — it gets it from
- * /api/runner, which speaks its own secret. It is handed the level rather than
- * allowed to set it, which is the right way round.
+ * /api/runner, which speaks its own secret. It is handed the policy rather
+ * than allowed to set it, which is the right way round.
  */
 
 import { getSession } from '../lib/auth.js';
 import { applyCors, readBody, send } from '../lib/http.js';
 import { isConfigured } from '../lib/db.js';
 import {
-  getConfirmLevel,
-  setConfirmLevel,
-  confirmLevelFromEnv,
-  CONFIRM_LEVELS,
-  DEFAULT_CONFIRM_LEVEL,
-  getNotificationLevel,
-  setNotificationLevel,
-  NOTIFICATION_LEVELS,
   getCommandPolicy,
   setCommandPolicy,
   COMMAND_POLICIES,
@@ -50,28 +43,13 @@ import {
   SettingsError,
 } from '../lib/settings.js';
 
-/** Shown next to each choice in the dropdown, so the UI and the API agree. */
-const DESCRIPTIONS = {
-  none: 'Never ask. Oscar deletes, sends and runs on your word alone.',
-  destructive: 'Ask before anything irreversible — deleting, sending, and risky commands.',
-  all: 'Ask before anything that changes something. Looking things up never asks.',
-};
-
-/** Shown next to each command-policy choice on the settings page. */
+/** Shown next to each command-policy choice, so the UI and the API agree. */
 const COMMAND_POLICY_DESCRIPTIONS = {
   off: 'Oscar cannot run anything on your computer. The tool is withheld entirely.',
-  confirm: 'Every command asks you first, and runs only if you say yes.',
+  confirm: 'Every command asks you first, harmless ones included.',
+  destructive:
+    'Only commands that could lose something ask — deleting, moving, installing, discarding work.',
   open: 'Commands run without asking. The denylist still refuses the catastrophic ones.',
-};
-
-/** Shown next to each notification level choice in the dropdown. */
-const NOTIFICATION_DESCRIPTIONS = {
-  'all clear on everything, no confirmation':
-    'Notifications are sent but never shown. Destructive commands proceed immediately.',
-  'confirmation on only destructive commands':
-    'Notifications for destructive actions (delete email, send email, run pwsh command) require a response.',
-  'confirmation on all commands':
-    'Every notification requires a response before the action proceeds.',
 };
 
 /** The one-liner under the toggle. Kept here so the UI and the API agree. */
@@ -98,13 +76,9 @@ export default async function handler(req, res) {
         // False means the dropdown is read-only: there is nowhere to write the
         // answer, so it shows what the environment says and says why.
         storable: isConfigured(),
-        confirmLevel: await getConfirmLevel({}),
-        levels: CONFIRM_LEVELS.map((level) => ({ level, description: DESCRIPTIONS[level] })),
-        default: DEFAULT_CONFIRM_LEVEL,
-        fallback: confirmLevelFromEnv(),
         hint: isConfigured()
           ? undefined
-          : 'No database is configured, so this is fixed by OSCAR_CONFIRM_LEVEL.',
+          : 'No database is configured, so the settings here are fixed by the environment.',
         // Whether Oscar may touch the machine at all. Sent with its own
         // default and env fallback, like background catching, because a
         // deployment without a database still has a real answer for it.
@@ -115,12 +89,6 @@ export default async function handler(req, res) {
         })),
         commandPolicyDefault: DEFAULT_COMMAND_POLICY,
         commandPolicyFallback: commandPolicyFromEnv(),
-
-        notificationLevel: await getNotificationLevel({}),
-        notificationLevels: NOTIFICATION_LEVELS.map((level) => ({
-          level,
-          description: NOTIFICATION_DESCRIPTIONS[level],
-        })),
 
         // Whether Oscar files away the people you mention as you talk. Sent
         // with its own default and env fallback because, unlike the levels
@@ -136,20 +104,11 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'Use GET or POST.' });
 
     const body = await readBody(req);
-    const confirmLevel = body.confirmLevel ?? body.level ?? body.confirm;
-    const notificationLevel = body.notificationLevel ?? body.notification_level ?? body.notification;
     const backgroundCatching = body.backgroundCatching ?? body.background_catching;
     const commandPolicy = body.commandPolicy ?? body.command_policy;
 
-    let savedConfirm = null;
-    let savedNotification = null;
     let savedCatching = null;
     let savedCommandPolicy = null;
-
-    if (confirmLevel != null) {
-      savedConfirm = await setConfirmLevel(confirmLevel, {});
-      console.log(`[oscar] confirm level set to "${savedConfirm}"`);
-    }
 
     if (commandPolicy != null) {
       savedCommandPolicy = await setCommandPolicy(commandPolicy, {});
@@ -158,26 +117,23 @@ export default async function handler(req, res) {
       console.log(`[oscar] command policy set to "${savedCommandPolicy}"`);
     }
 
-    if (notificationLevel != null) {
-      savedNotification = await setNotificationLevel(notificationLevel, {});
-      console.log(`[oscar] notification level set to "${savedNotification}"`);
-    }
-
     // `!= null` rather than a truthiness check: false is the whole point of
     // this setting, and `if (backgroundCatching)` would make turning it off
     // silently do nothing.
     if (backgroundCatching != null) {
       savedCatching = await setBackgroundCatching(backgroundCatching, {});
-      // Worth a log line for the same reason the confirm level is: this decides
-      // whether Oscar is keeping notes on the people you mention, and the
+      // Worth a log line for the same reason the command policy is: this
+      // decides whether Oscar keeps notes on the people you mention, and the
       // server log is the only record that it changed.
       console.log(`[oscar] background catching turned ${savedCatching ? 'on' : 'off'}`);
     }
 
+    // Each field is the value now stored, or null when this request did not
+    // touch that setting. The page uses it to redraw the control from what
+    // the server actually accepted rather than from what was clicked.
     return send(res, 200, {
       ok: true,
-      confirmLevel: savedConfirm,
-      notificationLevel: savedNotification,
+      commandPolicy: savedCommandPolicy,
       backgroundCatching: savedCatching,
     });
   } catch (err) {

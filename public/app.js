@@ -205,7 +205,9 @@ let commandPolicy = null;
 const COMMAND_POLICY_NOTES = {
   off: 'Off. Oscar cannot run anything on your computer, and will say so if asked.',
   confirm:
-    'Every command asks first. You get a notification, and nothing runs until you say yes.',
+    'Every command asks first, harmless ones included. Nothing runs until you say yes.',
+  destructive:
+    'Only commands that could lose something ask — deleting, moving, installing, discarding work. Reading and building just run.',
   open:
     'Commands run without asking. Your computer still refuses the catastrophic ones — that is not a setting.',
 };

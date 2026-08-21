@@ -79,11 +79,16 @@ There are two places to choose how much asks, and they answer to each other.
 | Setting | What happens |
 | --- | --- |
 | No commands at all | Nothing runs. The tool is withheld from the model and the runner is handed no work. |
-| Every command, with confirmation | Each one asks you first. |
+| Every command, with confirmation | Each one asks you first, harmless ones included. |
+| Only risky commands need confirmation | **Default.** Deleting, moving, installing and discarding work ask; reading and building just run. |
 | Every command, without confirmation | They run. The denylist still refuses the catastrophic ones. |
 
 The runner picks this up on its next poll, within a few seconds. Nothing to
 restart.
+
+The default is the third one, and deliberately not the second. A setting that
+asks about `git status` teaches you to approve without reading, and an approval
+given without reading protects nothing.
 
 **On the laptop** is `--confirm`, which is finer-grained and which wins
 when you pass it. Without it, the website decides; with it, this machine is

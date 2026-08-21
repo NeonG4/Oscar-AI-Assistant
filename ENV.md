@@ -15,6 +15,7 @@ If you just want the checklist, jump to [The 15-minute path](#the-15-minute-path
 - [Full variable reference](#full-variable-reference)
   - [`OPENAI_API_KEY`](#openai_api_key--required)
   - [`OPENAI_MODEL`](#openai_model--optional)
+  - [`OSCAR_OPENAI_MAX_ATTEMPTS`](#oscar_openai_max_attempts--optional)
   - [`OSCAR_MAX_WORDS`](#oscar_max_words--optional)
   - [`OSCAR_PERSONA`](#oscar_persona--optional)
   - [`OSCAR_SHARED_SECRET`](#oscar_shared_secret--required)
@@ -207,6 +208,44 @@ at <https://platform.openai.com/docs/models>.
 
 **Verify:** `/api/health` → `agent.model` shows your value; the pill in the top
 right of the web console shows it too.
+
+---
+
+### `OSCAR_OPENAI_MAX_ATTEMPTS` — optional
+
+**Default:** `3`
+
+How many times one model call may be attempted before the error is handed back
+to you. It exists for a specific failure that looks worse in the logs than it
+is:
+
+```
+Rate limit reached for gpt-4o in organization org-... on tokens per min (TPM):
+Limit 30000, Used 28935, Requested 2033. Please try again in 1.936s.
+```
+
+That is not a broken request. It is the account being two seconds early, and
+the fix is to wait the two seconds — which is what the attempts after the first
+one are for. Oscar reads the delay out of the reply (`Retry-After`,
+`Retry-After-Ms`, or the sentence itself) and waits exactly that long rather
+than guessing.
+
+**The waiting is not extra time.** Every retry comes out of the budget the call
+already had, so a rate-limited question can never run longer than a slow one; if
+the wait would not fit, the error comes back immediately instead. On the
+background path a rate-limited round is simply picked up by the next
+invocation, with nothing lost.
+
+Two 429s are never retried, whatever this is set to: `insufficient_quota` and
+anything about billing. Those mean the account is out of money, not out of
+patience, and waiting only makes you read the same message more slowly.
+
+Set it to `1` to turn retrying off entirely. Anything above `6` is capped —
+holding a serverless function open on repeat is its own kind of failure.
+
+If you see rate limits constantly rather than occasionally, this is a plaster:
+the real fixes are raising the account's tier, or pointing `OSCAR_DEEP_MODEL`
+at something with a bigger token allowance.
 
 ---
 
@@ -492,6 +531,7 @@ the Shortcut, not your environment variables.
 | Still `false` after redeploying | Variable name typo, or it wasn't ticked for the Production environment |
 | "Server is missing OPENAI_API_KEY" | As above |
 | `insufficient_quota` from OpenAI | Key is valid but the account has no credit. Add a balance |
+| "The model is rate limited right now" | Oscar already waited and asked again. The account is genuinely over its per-minute allowance — raise the tier, or see [`OSCAR_OPENAI_MAX_ATTEMPTS`](#oscar_openai_max_attempts--optional) |
 | `401` / "Incorrect API key" | Key was revoked, or you pasted a truncated copy |
 | "The code could not be emailed" | Provider key wrong, or `OSCAR_MAIL_FROM` isn't a verified sender |
 | Code never arrives, health says `"log"` | No provider key detected — it's in your Vercel logs |

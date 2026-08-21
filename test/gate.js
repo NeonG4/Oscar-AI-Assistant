@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 
 const SECRET = 'test-secret';
 
-function runScenario({ name, command, answer, expect }) {
+function runScenario({ name, command, answer, expect, policy = null, pinned = true }) {
   return new Promise((resolve) => {
     const log = [];
     let questionAsked = null;
@@ -46,9 +46,9 @@ function runScenario({ name, command, answer, expect }) {
         if (msg.action === 'claim') {
           if (questionAsked === null && settled === null && !server.handedOut) {
             server.handedOut = true;
-            return reply({ command: { id: 'cmd-1', command, timeoutMs: 15000 } });
+            return reply({ command: { id: 'cmd-1', command, timeoutMs: 15000 }, policy });
           }
-          return reply({ command: null });
+          return reply({ command: null, policy });
         }
         if (msg.action === 'confirm') {
           questionAsked = { why: msg.why, runner: msg.runner };
@@ -73,9 +73,15 @@ function runScenario({ name, command, answer, expect }) {
 
     server.listen(0, () => {
       const port = server.address().port;
+      // Passing --confirm PINS the laptop and makes it ignore the policy, so a
+      // scenario testing the website setting must not pass it. That is the
+      // whole contract between the two, and getting it backwards here would
+      // make these tests pass against a runner that ignored the server.
       const child = spawn(
         process.execPath,
-        ['scripts/runner.js', '--once', '--confirm', 'destructive'],
+        pinned
+          ? ['scripts/runner.js', '--once', '--confirm', 'destructive']
+          : ['scripts/runner.js', '--once'],
         {
           env: {
             ...process.env,
@@ -175,6 +181,56 @@ results.push(
     answer: 'Yes, run it',
     expect: ({ questionAsked, settled }) =>
       questionAsked === null && settled && settled.status === 'refused',
+  })
+);
+
+/* ---------------------------------------------------- the website setting */
+
+results.push(
+  await runScenario({
+    name: 'policy open lets a destructive command through without asking',
+    command: 'pwsh -c "Remove-Item nothing-here.tmp -ErrorAction SilentlyContinue; Write-Output ran"',
+    policy: 'open',
+    pinned: false,
+    answer: null,
+    expect: ({ questionAsked, settled }) =>
+      questionAsked === null && settled && settled.status === 'done' && /ran/.test(settled.stdout || ''),
+  })
+);
+
+results.push(
+  await runScenario({
+    name: 'policy confirm makes even a harmless command ask',
+    command: 'git --version',
+    policy: 'confirm',
+    pinned: false,
+    answer: 'Yes, run it',
+    expect: ({ questionAsked, settled }) =>
+      questionAsked !== null && settled && settled.status === 'done',
+  })
+);
+
+results.push(
+  await runScenario({
+    name: 'policy destructive leaves a harmless command alone',
+    command: 'git --version',
+    policy: 'destructive',
+    pinned: false,
+    answer: null,
+    expect: ({ questionAsked, settled }) =>
+      questionAsked === null && settled && settled.status === 'done',
+  })
+);
+
+results.push(
+  await runScenario({
+    name: 'a pinned runner ignores a looser website setting',
+    command: 'pwsh -c "Remove-Item nothing-here.tmp -ErrorAction SilentlyContinue"',
+    policy: 'open',
+    pinned: true,
+    answer: 'No, cancel it',
+    expect: ({ questionAsked, settled }) =>
+      questionAsked !== null && settled && settled.status === 'refused',
   })
 );
 

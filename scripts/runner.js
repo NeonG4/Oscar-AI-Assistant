@@ -217,9 +217,10 @@ function resolveCwd(requested) {
 /**
  * What the website says this machine should be doing.
  *
- *   off      no work is handed out at all, so there is nothing to translate.
- *   confirm  ask before every command.
- *   open     ask before none of them.
+ *   off          no work is handed out, so there is nothing to translate.
+ *   confirm      ask before every command.
+ *   destructive  ask before the ones that could lose something.
+ *   open         ask before none of them.
  *
  * WHY THE SERVER GETS A SAY AT ALL, GIVEN EVERYTHING ELSE IN THIS FILE
  *
@@ -236,6 +237,9 @@ function resolveCwd(requested) {
 function confirmModeFor(policy) {
   if (policy === 'open') return 'none';
   if (policy === 'confirm') return 'all';
+  if (policy === 'destructive') return 'destructive';
+  // `off` and anything unrecognised: leave the local setting alone. A policy
+  // this build does not know about must not silently loosen the machine.
   return null;
 }
 
