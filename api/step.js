@@ -43,12 +43,38 @@ import {
 } from '../lib/jobs.js';
 
 /**
- * Stop well short of the function's own limit so there is room to write the
- * checkpoint and fire the next hop. Losing the state because we ran the loop
- * right up to the wall would be the worst possible failure here.
+ * How much of the function's own limit one invocation spends on rounds.
+ *
+ * vercel.json gives these functions 60 seconds. Time not spent here is not
+ * saved, it is paid again: every handoff costs a response, a cold start and a
+ * reload of the state, so a budget of 40s rather than 55s meant roughly a third
+ * more invocations for the same work.
  */
-const INVOCATION_BUDGET_MS = Number(process.env.OSCAR_STEP_BUDGET_MS) || 40000;
+const INVOCATION_BUDGET_MS = Number(process.env.OSCAR_STEP_BUDGET_MS) || 55000;
+
+/**
+ * Held back from that budget for the checkpoint write and the handoff. Losing
+ * the state because we ran the loop right up to the wall would be the worst
+ * possible failure here.
+ */
 const CHECKPOINT_HEADROOM_MS = 8000;
+
+/**
+ * Never START a round without at least this much runway left.
+ *
+ * A round the platform kills half way through is worse than one that never
+ * began: the invocation dies before it can either checkpoint or hand off, and
+ * the job stops dead with nothing left to restart it.
+ */
+const MIN_ROUND_RUNWAY_MS = 12000;
+
+// Exported for the test that checks these three still fit inside the
+// maxDuration vercel.json hands the function. Nothing else reads them.
+export {
+  INVOCATION_BUDGET_MS as STEP_BUDGET_MS,
+  CHECKPOINT_HEADROOM_MS as STEP_HEADROOM_MS,
+  MIN_ROUND_RUNWAY_MS as STEP_MIN_ROUND_RUNWAY_MS,
+};
 
 /**
  * Tell the phone the job is over.
@@ -144,7 +170,13 @@ export default async function handler(req, res) {
       return send(res, 200, { ok: false, status: 'failed', error: 'No state to resume from.' });
     }
 
-    if (job.status === 'queued') await markRunning(jobId);
+    // Touched at the START of every invocation, not just the first. It is what
+    // makes a quiet job distinguishable from a dead one: with this, the row can
+    // never go longer than a single round without moving, so the app can treat
+    // a longer silence than that as a dropped handoff and restart the job
+    // itself. Without it, two slow rounds in a row look exactly like a job
+    // whose baton was lost.
+    await markRunning(jobId);
 
     let state = job.state;
     let steps = job.steps || 0;
@@ -156,9 +188,9 @@ export default async function handler(req, res) {
     const mission = isMissionState(state);
     const ceiling = mission ? MAX_MISSION_STEPS : MAX_JOB_STEPS;
 
-    // Keep going while there is comfortably enough time left to finish a round
-    // AND still checkpoint afterwards.
-    while (Date.now() < deadline - CHECKPOINT_HEADROOM_MS) {
+    // Keep going while there is comfortably enough time left to start a round,
+    // finish it, AND still checkpoint afterwards.
+    while (Date.now() < deadline - CHECKPOINT_HEADROOM_MS - MIN_ROUND_RUNWAY_MS) {
       if (steps >= ceiling) {
         const gaveUp = `Gave up after ${ceiling} steps without an answer.`;
         await markFailed(jobId, gaveUp);
@@ -166,9 +198,31 @@ export default async function handler(req, res) {
         return send(res, 200, { ok: false, status: 'failed', steps });
       }
 
-      const step = mission
-        ? await runMissionStep(state, { env: process.env, deadline })
-        : await runAgentStep(state, { env: process.env, deadline });
+      // The model call gets whatever is left of this invocation, less the
+      // headroom. Without a timeout of its own it runs on lib/agent.js's flat
+      // 45-second clock, which can comfortably outlive the function holding it.
+      const timeoutMs = deadline - CHECKPOINT_HEADROOM_MS - Date.now();
+
+      let step;
+      try {
+        step = mission
+          ? await runMissionStep(state, { env: process.env, deadline, timeoutMs })
+          : await runAgentStep(state, { env: process.env, deadline, timeoutMs });
+      } catch (err) {
+        // A model call cut short because THIS invocation was running out is not
+        // a failed job. `state` is still what it was before the round, and no
+        // tool has run yet at that point, so the round simply happens again in
+        // the next invocation with a full budget to do it in.
+        if (
+          err instanceof AgentError &&
+          err.status === 504 &&
+          Date.now() >= deadline - CHECKPOINT_HEADROOM_MS
+        ) {
+          break;
+        }
+        throw err;
+      }
+
       state = step.state;
       steps += 1;
 
@@ -221,20 +275,27 @@ export default async function handler(req, res) {
         });
         return send(res, 200, { ok: true, status: 'awaiting_confirm', steps });
       }
+
+      // Checkpoint after every round, not only when the invocation runs out.
+      // Two things depend on it: the progress panel, which would otherwise sit
+      // frozen for the length of a whole invocation and make a working job look
+      // like a hung one, and recovery — a round that has been written down
+      // never has to be paid for twice.
+      //
+      // `tasks` is written on the job itself so the Jobs tab can show progress
+      // without loading the whole state blob, and so it survives the state
+      // being dropped when the job finishes.
+      await saveProgress(jobId, {
+        state,
+        events: state.events || [],
+        tasks: state.tasks || [],
+        steps,
+      });
     }
 
-    // Out of budget for THIS invocation, not for the job. Checkpoint and pass
-    // the baton to a fresh one.
-    await saveProgress(jobId, {
-      state,
-      events: state.events || [],
-      // Written on the job itself so the Jobs tab can show progress without
-      // loading the whole state blob, and so it survives the state being
-      // dropped when the job finishes.
-      tasks: state.tasks || [],
-      steps,
-    });
-    const handedOff = continueJob(jobId);
+    // Out of budget for THIS invocation, not for the job. The loop above has
+    // already checkpointed, so all that is left is to pass the baton on.
+    const handedOff = await continueJob(jobId);
 
     return send(res, 200, {
       ok: true,

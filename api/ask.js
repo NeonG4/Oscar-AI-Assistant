@@ -303,8 +303,11 @@ export default async function handler(req, res) {
         { env: process.env }
       );
 
-      // Fire the first step without waiting — the whole point is to answer now.
-      continueJob(job.id, { env: process.env });
+      // Start the run without waiting for it — the whole point is to answer
+      // now. The await is only for the request to leave the machine, which is
+      // the difference between a job that starts and one that sits in 'queued'
+      // forever because its first hop was dropped on the way out.
+      await continueJob(job.id, { env: process.env });
 
       const answer = wantsMission
         ? "I'll plan that out and work through it. You'll get a notification when it's done."

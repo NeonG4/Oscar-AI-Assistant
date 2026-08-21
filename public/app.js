@@ -675,6 +675,41 @@ let pollTimer = null;
 let watchingJob = null;
 
 /**
+ * How often to ask a running job how it is getting on.
+ *
+ * Fast at first, because the first half-minute is when someone is actually
+ * watching the panel. A job still going after that is one you have looked away
+ * from, and a poll every three seconds is plenty to catch the end of it.
+ */
+const POLL_FAST_MS = 1200;
+const POLL_SLOW_MS = 3000;
+const POLL_SLOW_AFTER_MS = 90 * 1000;
+
+/**
+ * How long a job may go quiet before this page pokes it.
+ *
+ * The server advances a job by POSTing to itself, fire and forget, and that hop
+ * can be dropped — a function that has already responded may never get its last
+ * request out of the door. This page calling /api/step is the second of the two
+ * ways a job moves, and the reason a dropped hop costs a pause rather than the
+ * whole run.
+ *
+ * The two numbers are different because the two silences mean different things.
+ * 'queued' means no invocation ever picked the job up, which is settled within
+ * a second or two of asking. 'running' means one did and then went quiet — and
+ * a job that is merely thinking hard goes quiet too, for as long as one round
+ * takes. The server touches the row when an invocation starts and again after
+ * every round, so the longest honest silence is a single round; this clears
+ * that with room to spare, because nudging a job that was working would run it
+ * twice over.
+ */
+const QUEUED_STALL_MS = 10 * 1000;
+const RUNNING_STALL_MS = 75 * 1000;
+
+/** Enough to rescue a dropped hop; not so many that a stuck job loops forever. */
+const MAX_NUDGES = 5;
+
+/**
  * The pill next to "Oscar's thinking".
  *
  * Two labels, not one. The detailed label is the true one — "running · 12
@@ -823,8 +858,8 @@ function renderEvents(events, alreadyShown) {
  *
  * Polling rather than a socket on purpose: it survives the tab being
  * backgrounded, reconnects for free, and needs no server-side connection state.
- * Each poll also nudges the job along if its self-continuation was ever lost —
- * which is why a dropped hop is recoverable rather than fatal.
+ * A poll that finds the job has gone quiet also nudges it along, which is why a
+ * lost handoff is recoverable rather than fatal.
  *
  * @param {object} [reply] the turn in the thread this job is answering, if any.
  */
@@ -834,7 +869,15 @@ async function watchJob(jobId, token, reply) {
 
   let shown = 0;
   const startedAt = Date.now();
-  const GIVE_UP_AFTER = 5 * 60 * 1000;
+
+  // Matched to JOB_TTL_MS on the server. Giving up before the job does was the
+  // one thing guaranteed to make a slow job look like a broken one.
+  const GIVE_UP_AFTER = 15 * 60 * 1000;
+
+  // When the job last visibly moved, and what it looked like then.
+  let lastMoved = Date.now();
+  let lastMark = '';
+  let nudges = 0;
 
   const tick = async () => {
     if (watchingJob !== jobId) return;
@@ -848,6 +891,13 @@ async function watchJob(jobId, token, reply) {
 
       shown = renderEvents(job.events || [], shown);
       renderTasks(job.tasks || []);
+
+      // Any of these changing means an invocation is alive and checkpointing.
+      const mark = [job.status, job.steps, (job.events || []).length, job.updatedAt || ''].join(':');
+      if (mark !== lastMark) {
+        lastMark = mark;
+        lastMoved = Date.now();
+      }
 
       if (job.status === 'done') {
         setActivity('done', `done · ${job.steps} steps`);
@@ -898,11 +948,29 @@ async function watchJob(jobId, token, reply) {
 
       if (Date.now() - startedAt > GIVE_UP_AFTER) {
         setActivity('bad', 'gave up watching');
-        logLine('stopped watching after five minutes — the job may still finish', { kind: 'note' });
+        logLine('stopped watching after fifteen minutes — the job may still finish', { kind: 'note' });
         return stopWatching();
       }
 
-      pollTimer = setTimeout(tick, 1200);
+      // Quiet for longer than a healthy invocation can be: its baton was
+      // dropped somewhere. Pick it up. Not awaited — /api/step does not answer
+      // until the step it starts has finished, and the poll above is how we
+      // find out what came of it.
+      const quietFor = Date.now() - lastMoved;
+      const stallLimit = job.status === 'queued' ? QUEUED_STALL_MS : RUNNING_STALL_MS;
+      if (quietFor > stallLimit && nudges < MAX_NUDGES) {
+        nudges += 1;
+        // Treated as movement, so a nudge is not immediately followed by
+        // another while the invocation it started gets going.
+        lastMoved = Date.now();
+        logLine('restarting a job that went quiet', {
+          kind: 'note',
+          how: `${Math.round(quietFor / 1000)}s without progress`,
+        });
+        api('/api/step', { jobId, ...(token ? { token } : {}) }).catch(() => {});
+      }
+
+      pollTimer = setTimeout(tick, Date.now() - startedAt > POLL_SLOW_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
     } catch (err) {
       logLine(String((err && err.message) || err), { kind: 'bad' });
       setActivity('bad', 'lost the job');

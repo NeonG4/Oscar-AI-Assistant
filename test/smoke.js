@@ -8,6 +8,7 @@
 
 import assert from 'node:assert/strict';
 import nodeCrypto from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import {
   askAgent,
@@ -124,6 +125,7 @@ import {
   createJobToken,
   readJobToken,
   selfUrl,
+  continueJob,
   MAX_JOB_STEPS,
 } from '../lib/jobs.js';
 import {
@@ -162,7 +164,11 @@ import {
 import askHandler from '../api/ask.js';
 import runnerHandler from '../api/runner.js';
 import pushHandler from '../api/push.js';
-import stepHandler from '../api/step.js';
+import stepHandler, {
+  STEP_BUDGET_MS,
+  STEP_HEADROOM_MS,
+  STEP_MIN_ROUND_RUNWAY_MS,
+} from '../api/step.js';
 import jobsHandler from '../api/jobs.js';
 import confirmHandler from '../api/confirm.js';
 import historyHandler from '../api/history.js';
@@ -3249,6 +3255,80 @@ await test('listing every job always needs a real session', async () => {
 
 await test('the job step ceiling is a real number', () => {
   assert.ok(MAX_JOB_STEPS >= 10 && MAX_JOB_STEPS <= 200);
+});
+
+/* --------------------------------------------------------------------------
+ *  HOW LONG A JOB TAKES
+ *
+ *  The three tests below are about wall clock rather than correctness. A job
+ *  that eventually produces the right answer is still broken if it took ten
+ *  minutes to do it, and each of these pins one of the reasons it used to.
+ * ------------------------------------------------------------------------ */
+
+await test('one invocation always fits inside the function limit it was given', () => {
+  const vercel = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'));
+  const limitMs = vercel.functions['api/*.js'].maxDuration * 1000;
+
+  // Two directions, and both matter. Overrunning means the platform kills the
+  // invocation before it can checkpoint or hand off, and the job stops dead
+  // with nothing to restart it. Undershooting is not free either: the unused
+  // seconds come back as extra handoffs, each one a cold start and a reload.
+  assert.ok(STEP_BUDGET_MS + 2000 <= limitMs, 'the budget must leave room to respond');
+  assert.ok(STEP_BUDGET_MS >= limitMs * 0.75, 'a budget this far under the limit just buys more handoffs');
+  assert.ok(STEP_MIN_ROUND_RUNWAY_MS >= STEP_HEADROOM_MS, 'a round needs more runway than the write after it');
+});
+
+await test('a step checkpoints after every round, not only when it runs out', async () => {
+  applyEnv(J_ENV);
+  const jobsDb = fakeJobsDb();
+  const patches = [];
+  const openai = fakeOpenAIWithTools([WEATHER_CALL, FINAL]);
+  globalThis.fetch = async (url, init = {}) => {
+    if (!String(url).includes('supabase')) return openai(url, init);
+    if ((init.method || 'GET') === 'PATCH') patches.push(JSON.parse(init.body));
+    return jobsDb(url, init);
+  };
+
+  const askRes = fakeRes();
+  await askHandler(fakeReq({ headers: { 'x-oscar-key': 'letmein' },
+    body: { question: 'build me a plan for working out' } }), askRes);
+  const { jobId, jobToken } = askRes.json();
+
+  await stepHandler(fakeReq({ url: '/api/step', body: { jobId, token: jobToken } }), fakeRes());
+
+  // The tool round is written down before the answering round begins. Without
+  // this the progress panel shows nothing at all until the invocation ends,
+  // which is a working job wearing the face of a hung one.
+  const midRun = patches.filter((p) => p.status === 'running' && p.state);
+  assert.ok(midRun.length >= 1, 'the round before the last should have been checkpointed');
+  assert.ok(
+    midRun.some((p) => (p.events || []).some((e) => e.tool === 'get_weather')),
+    'the checkpoint must carry the trace the app renders'
+  );
+});
+
+await test('a handoff is dispatched before the invocation that fired it returns', async () => {
+  const sent = [];
+  const fired = await continueJob('job-7', {
+    env: { ...J_ENV, OSCAR_BASE_URL: 'https://oscar.test' },
+    fetchImpl: async (url, init) => {
+      // Recorded a tick late, the way a real request reaches the wire after the
+      // call that started it has already returned. A caller that does not wait
+      // sees nothing here.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      sent.push({ url: String(url), body: JSON.parse(init.body) });
+      return { ok: true, status: 200, text: async () => '{}' };
+    },
+  });
+
+  // A serverless function stops existing the moment it responds, so a hop that
+  // is only queued on the event loop is a hop that never happens — and a job
+  // whose baton was dropped there has nothing left to restart it.
+  assert.equal(fired, true);
+  assert.equal(sent.length, 1, 'the request must have left before we carried on');
+  assert.match(sent[0].url, /\/api\/step$/);
+  assert.equal(sent[0].body.jobId, 'job-7');
+  assert.equal(readJobToken(sent[0].body.token, { ...J_ENV }), 'job-7', 'each hop mints its own token');
 });
 
 /* ==========================================================================
