@@ -536,7 +536,17 @@ alter table public.jobs add column if not exists question_id uuid;
 --  sleep, and for the laptop polling for commands. None of those can read
 --  localStorage, so the answer is written down here instead.
 --
---  One row per setting, keyed by name. Today there are two:
+--  One row per setting, keyed by name:
+--
+--    command_policy       "off" | "confirm" | "open"
+--                         whether Oscar may run commands on your computer at
+--                         all, and whether each one asks first. Read by the
+--                         shell tool before queueing and by /api/runner on
+--                         every claim, so changing it takes effect within a
+--                         few seconds without restarting the runner.
+--                         Defaults to "confirm", and every failure path lands
+--                         there too: an unreadable answer must not be the
+--                         thing that lets commands run unattended.
 --
 --    confirm_level        "none" | "destructive" | "all"
 --                         how much Oscar asks before doing something. See
@@ -569,6 +579,10 @@ revoke all on public.settings from anon, authenticated;
 
 -- What is Oscar currently set to ask about:
 --   select key, value, updated_at from public.settings;
+
+-- Stop Oscar touching the computer, without opening the website:
+--   insert into public.settings (key, value) values ('command_policy', '"off"')
+--   on conflict (key) do update set value = excluded.value, updated_at = now();
 
 -- Set it from here rather than the website, if you would rather:
 --   insert into public.settings (key, value) values ('confirm_level', '"all"')

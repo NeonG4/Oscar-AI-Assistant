@@ -72,7 +72,28 @@ misheard. Those stop, send a question to your phone, and run only if you say
 yes. Anything else is a no: silence is a no, a network failure is a no, and
 after five minutes an unanswered command is a no.
 
-You choose how much asks:
+There are two places to choose how much asks, and they answer to each other.
+
+**On the website**, under Settings, is the one you will actually use:
+
+| Setting | What happens |
+| --- | --- |
+| No commands at all | Nothing runs. The tool is withheld from the model and the runner is handed no work. |
+| Every command, with confirmation | Each one asks you first. |
+| Every command, without confirmation | They run. The denylist still refuses the catastrophic ones. |
+
+The runner picks this up on its next poll, within a few seconds. Nothing to
+restart.
+
+**On the laptop** is `--confirm`, which is finer-grained and which wins
+when you pass it. Without it, the website decides; with it, this machine is
+pinned and the website cannot loosen it. The runner says which is in charge in
+its startup banner.
+
+Note what the website can and cannot reach. It can change how much this machine
+**asks**. It can never change what this machine **refuses** — the denylist, the
+allowlist, the root confinement and the escalation ban are all still decided on
+the laptop and are not reachable from the deployment at any setting.
 
 | `--confirm` | What asks first |
 | --- | --- |

@@ -241,6 +241,26 @@
       <!-- -------------------- settings -------------------- -->
       <div id="pane-settings" class="pane" hidden>
         <!--
+          First card in the pane, above even background catching, because this
+          is the only setting on the page that decides whether something runs
+          on hardware you own.
+        -->
+        <section class="card" aria-labelledby="commands-h">
+          <h2 id="commands-h">Your computer</h2>
+
+          <label class="choice" for="set-command-policy">
+            <b>Running commands</b>
+            <select id="set-command-policy" disabled>
+              <option value="off">No commands at all</option>
+              <option value="confirm">Every command, with confirmation</option>
+              <option value="open">Every command, without confirmation</option>
+            </select>
+          </label>
+
+          <p class="meta subtle choice-note" id="command-policy-note">Loading…</p>
+        </section>
+
+        <!--
           First card in the pane, deliberately. Everything below it changes what
           you see; this changes what Oscar keeps, and it is stored on the server
           rather than in this browser because it has to hold for the Shortcut on

@@ -38,6 +38,11 @@ import {
   getNotificationLevel,
   setNotificationLevel,
   NOTIFICATION_LEVELS,
+  getCommandPolicy,
+  setCommandPolicy,
+  COMMAND_POLICIES,
+  DEFAULT_COMMAND_POLICY,
+  commandPolicyFromEnv,
   getBackgroundCatching,
   setBackgroundCatching,
   backgroundCatchingFromEnv,
@@ -50,6 +55,13 @@ const DESCRIPTIONS = {
   none: 'Never ask. Oscar deletes, sends and runs on your word alone.',
   destructive: 'Ask before anything irreversible — deleting, sending, and risky commands.',
   all: 'Ask before anything that changes something. Looking things up never asks.',
+};
+
+/** Shown next to each command-policy choice on the settings page. */
+const COMMAND_POLICY_DESCRIPTIONS = {
+  off: 'Oscar cannot run anything on your computer. The tool is withheld entirely.',
+  confirm: 'Every command asks you first, and runs only if you say yes.',
+  open: 'Commands run without asking. The denylist still refuses the catastrophic ones.',
 };
 
 /** Shown next to each notification level choice in the dropdown. */
@@ -93,6 +105,17 @@ export default async function handler(req, res) {
         hint: isConfigured()
           ? undefined
           : 'No database is configured, so this is fixed by OSCAR_CONFIRM_LEVEL.',
+        // Whether Oscar may touch the machine at all. Sent with its own
+        // default and env fallback, like background catching, because a
+        // deployment without a database still has a real answer for it.
+        commandPolicy: await getCommandPolicy({}),
+        commandPolicies: COMMAND_POLICIES.map((policy) => ({
+          policy,
+          description: COMMAND_POLICY_DESCRIPTIONS[policy],
+        })),
+        commandPolicyDefault: DEFAULT_COMMAND_POLICY,
+        commandPolicyFallback: commandPolicyFromEnv(),
+
         notificationLevel: await getNotificationLevel({}),
         notificationLevels: NOTIFICATION_LEVELS.map((level) => ({
           level,
@@ -116,14 +139,23 @@ export default async function handler(req, res) {
     const confirmLevel = body.confirmLevel ?? body.level ?? body.confirm;
     const notificationLevel = body.notificationLevel ?? body.notification_level ?? body.notification;
     const backgroundCatching = body.backgroundCatching ?? body.background_catching;
+    const commandPolicy = body.commandPolicy ?? body.command_policy;
 
     let savedConfirm = null;
     let savedNotification = null;
     let savedCatching = null;
+    let savedCommandPolicy = null;
 
     if (confirmLevel != null) {
       savedConfirm = await setConfirmLevel(confirmLevel, {});
       console.log(`[oscar] confirm level set to "${savedConfirm}"`);
+    }
+
+    if (commandPolicy != null) {
+      savedCommandPolicy = await setCommandPolicy(commandPolicy, {});
+      // Worth a log line: this one decides whether a machine you own will
+      // execute what a model asked for.
+      console.log(`[oscar] command policy set to "${savedCommandPolicy}"`);
     }
 
     if (notificationLevel != null) {

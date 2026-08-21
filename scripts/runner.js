@@ -66,6 +66,7 @@ function parseArgs(argv) {
     interval: Number(process.env.OSCAR_RUNNER_INTERVAL_MS) || 3000,
     allow: [...DEFAULT_ALLOWED],
     confirm: process.env.OSCAR_RUNNER_CONFIRM || 'destructive',
+    confirmPinned: Boolean(process.env.OSCAR_RUNNER_CONFIRM),
     once: false,
   };
 
@@ -77,7 +78,12 @@ function parseArgs(argv) {
     else if (arg === '--once') opts.once = true;
     else if (arg === '--root') opts.root = valueOf() || opts.root;
     else if (arg === '--interval') opts.interval = Number(valueOf()) || opts.interval;
-    else if (arg === '--confirm') opts.confirm = valueOf() || opts.confirm;
+    else if (arg === '--confirm') {
+      opts.confirm = valueOf() || opts.confirm;
+      // Typing the flag pins the laptop to it. Without it, the website
+      // setting governs — see followAccountPolicy.
+      opts.confirmPinned = true;
+    }
     else if (arg === '--allow') opts.allow.push(...valueOf().split(',').map((s) => s.trim()).filter(Boolean));
     else if (arg === '--help' || arg === '-h') opts.help = true;
   }
@@ -111,6 +117,9 @@ Oscar runner — lets Oscar run commands on this machine.
                                           destructive  the risky ones (default)
                                           all          every single one
                                           none         never ask
+
+  Without --confirm, the setting on the website decides. Passing it pins this
+  machine to your choice and the website cannot loosen it.
   npm run runner -- --once              claim at most one command, then exit
 
 Needs OSCAR_RUNNER_SECRET and OSCAR_BASE_URL, from the environment or .env.local.
@@ -201,6 +210,33 @@ function resolveCwd(requested) {
   }
   if (!fs.existsSync(target)) throw new Error(`No such directory: ${target}`);
   return target;
+}
+
+/* --------------------------------------------------------- account policy */
+
+/**
+ * What the website says this machine should be doing.
+ *
+ *   off      no work is handed out at all, so there is nothing to translate.
+ *   confirm  ask before every command.
+ *   open     ask before none of them.
+ *
+ * WHY THE SERVER GETS A SAY AT ALL, GIVEN EVERYTHING ELSE IN THIS FILE
+ *
+ * Because the alternative is a setting you can only change by walking to the
+ * laptop and restarting a process, which is not a setting. The property that
+ * actually matters is preserved either way: the server can change how much
+ * this machine ASKS, and can never change what it REFUSES. The denylist, the
+ * allowlist, the root confinement and the escalation ban are all still decided
+ * here and are not reachable from the deployment at any policy.
+ *
+ * And if you would rather the laptop kept the last word on asking too, pass
+ * --confirm explicitly. That pins it, and the website cannot loosen it.
+ */
+function confirmModeFor(policy) {
+  if (policy === 'open') return 'none';
+  if (policy === 'confirm') return 'all';
+  return null;
 }
 
 /* ------------------------------------------------------------ confirmation */
@@ -374,7 +410,10 @@ async function main() {
   console.log(
     `  mode        ${opts.mode}${opts.mode === 'allowlist' ? ` (${opts.allow.length} programs)` : ' — denylist only'}`
   );
-  console.log(`  confirm     ${CONFIRM_DESCRIPTION[opts.confirm]}`);
+  console.log(
+    `  confirm     ${CONFIRM_DESCRIPTION[opts.confirm]}` +
+      (opts.confirmPinned ? ' (pinned here — the website cannot change it)' : ' (until the website says otherwise)')
+  );
   if (opts.confirm === 'none') {
     console.log(
       '\n  Nothing will ask before it runs. Only the denylist stands between a\n' +
@@ -384,10 +423,27 @@ async function main() {
   console.log('\nWaiting for commands. Ctrl-C to stop.');
 
   let quiet = 0;
+  // Only announce a policy when it changes, or an idle runner would print
+  // the same line every three seconds forever.
+  let lastPolicy = null;
 
   for (;;) {
     try {
-      const { command } = await post({ action: 'claim', runner: HOSTNAME });
+      const { command, policy } = await post({ action: 'claim', runner: HOSTNAME });
+
+      // The website setting arrives with every claim. Unless --confirm was
+      // typed on this machine, it is what decides how much stops to ask.
+      if (policy && !opts.confirmPinned) {
+        const wanted = confirmModeFor(policy);
+        if (wanted && wanted !== opts.confirm) {
+          opts.confirm = wanted;
+          console.log(`[${stamp()}] website setting: ${policy} — ${CONFIRM_DESCRIPTION[wanted]}`);
+        }
+      }
+      if (policy === 'off' && policy !== lastPolicy) {
+        console.log(`[${stamp()}] website setting: off — nothing will be handed out.`);
+      }
+      lastPolicy = policy || lastPolicy;
       if (command) {
         quiet = 0;
         await handle(command);

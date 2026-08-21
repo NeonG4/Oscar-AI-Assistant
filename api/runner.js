@@ -45,6 +45,7 @@ import {
 } from '../lib/commands.js';
 import { createQuestion, getQuestion, QuestionError } from '../lib/questions.js';
 import { notifyAll } from '../lib/push.js';
+import { getCommandPolicy } from '../lib/settings.js';
 
 function runnerSecret(env = process.env) {
   return (env.OSCAR_RUNNER_SECRET || '').trim();
@@ -94,8 +95,18 @@ export default async function handler(req, res) {
     const action = String(body.action || 'claim');
 
     if (action === 'claim') {
+      // The policy rides along on every claim so the laptop always has a
+      // fresh copy without a second round trip. The runner decides what to
+      // do with it; this end only reports it — and refuses to hand out work
+      // when the answer is off, so the switch holds even against a runner
+      // that ignores it.
+      const policy = await getCommandPolicy({});
+      if (policy === 'off') {
+        return send(res, 200, { ok: true, command: null, policy });
+      }
+
       const command = await claimNext({ runner: body.runner }, {});
-      return send(res, 200, { ok: true, command: command || null });
+      return send(res, 200, { ok: true, command: command || null, policy });
     }
 
     if (action === 'result') {

@@ -1131,6 +1131,50 @@ body[data-timing="off"] .meta-timing {
    there is a round trip, and bad, because the round trip can fail. Everything
    else about it is an ordinary .meta line. */
 
+/* A setting whose answer is one of several, rather than on or off. Laid out
+   like .toggle so the Settings pane reads as one list rather than two, but
+   stacked instead of side by side: these labels are longer than a checkbox
+   caption and wrap badly in a narrow column. */
+
+.choice {
+  display: block;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.choice:last-of-type {
+  border-bottom: 0;
+}
+
+.choice b {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.choice select {
+  width: 100%;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.choice select:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.choice select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .choice-note[data-state='saving'] {
   color: var(--muted);
   font-style: italic;

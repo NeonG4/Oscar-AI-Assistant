@@ -138,6 +138,7 @@ import {
   classifyCommand,
   CONFIRM_MODES,
   NEVER_ALLOWED,
+  splitCommand,
 } from '../lib/shell-policy.js';
 import {
   clampTimeout,
@@ -198,6 +199,10 @@ import {
   normalizeBackgroundCatching,
   setBackgroundCatching,
   DEFAULT_BACKGROUND_CATCHING,
+  COMMAND_POLICIES,
+  DEFAULT_COMMAND_POLICY,
+  commandPolicyFromEnv,
+  normalizeCommandPolicy,
 } from '../lib/settings.js';
 import {
   rememberPersonTool,
@@ -3659,6 +3664,47 @@ await test('segments split on every shell operator', () => {
   assert.deepEqual(splitSegments('  git status  '), ['git status']);
 });
 
+await test('a redirect target is a filename, not a program', () => {
+  // The refusal David actually hit: `echo ... > test_file.txt` came back as
+  // '"test_file.txt" is not on the allowlist'. Nothing executes a redirect
+  // target, and refusing it blocked the most ordinary way to write a file.
+  assert.equal(
+    classifyCommand("echo 'hello' > test_file.txt", { mode: 'allowlist' }).verdict,
+    'allow'
+  );
+  assert.equal(classifyCommand('echo hi >> notes.txt', { mode: 'allowlist' }).verdict, 'allow');
+  assert.equal(
+    classifyCommand('node x.js > out.log 2> err.log', { mode: 'allowlist' }).verdict,
+    'allow'
+  );
+
+  const parts = splitCommand("echo 'hi' > out.txt");
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].isRedirectTarget, false);
+  assert.equal(parts[1].isRedirectTarget, true);
+});
+
+await test('exempting redirect targets does not open a way in', () => {
+  // Two holes that the exemption above would otherwise create.
+
+  // Writing into a raw device is what `dd of=/dev/sda` does, and that was
+  // already refused. /dev/null stays fine, because redirecting into it is
+  // routine.
+  assert.equal(classifyCommand('echo x > /dev/sda', { mode: 'unrestricted' }).verdict, 'refuse');
+  assert.equal(classifyCommand('echo x > /dev/null', { mode: 'allowlist' }).verdict, 'allow');
+
+  // A target the shell has to RUN something to work out is a command wearing
+  // a filename, so it goes back to being allowlist-checked.
+  assert.equal(classifyCommand('ls > $(whoami).txt', { mode: 'allowlist' }).verdict, 'refuse');
+  assert.equal(classifyCommand('ls > `whoami`.txt', { mode: 'allowlist' }).verdict, 'refuse');
+
+  // A plain variable is only expansion, never execution, so it stays exempt.
+  assert.equal(
+    classifyCommand('echo hi > "$HOME/out.txt"', { mode: 'allowlist' }).verdict,
+    'allow'
+  );
+});
+
 await test('operators inside quotes are left alone', () => {
   // Needed once pwsh -c "..." is a legitimate command: splitting inside the
   // quoted payload chopped one command into fragments that were then refused
@@ -6099,6 +6145,29 @@ await test('only a clear yes counts as yes', () => {
   assert.equal(normalizeBackgroundCatching('on'), true);
   assert.equal(normalizeBackgroundCatching('maybe'), false);
   assert.equal(normalizeBackgroundCatching(null), false);
+});
+
+section('the command policy');
+
+await test('the three states are the ones the settings page offers', () => {
+  assert.deepEqual(COMMAND_POLICIES, ['off', 'confirm', 'open']);
+});
+
+await test('an unset or unreadable policy asks rather than runs', () => {
+  // The direction of every fallback here. A missing row, a typo in the
+  // database and an unrecognised env var must all land on `confirm`: the
+  // failure that asks you a question, never the one that executes silently.
+  assert.equal(DEFAULT_COMMAND_POLICY, 'confirm');
+  assert.equal(commandPolicyFromEnv({}), 'confirm');
+  assert.equal(normalizeCommandPolicy('nonsense'), 'confirm');
+  assert.equal(normalizeCommandPolicy(''), 'confirm');
+  assert.equal(normalizeCommandPolicy(null), 'confirm');
+  assert.equal(normalizeCommandPolicy(undefined), 'confirm');
+
+  // And the two deliberate answers still get through.
+  assert.equal(normalizeCommandPolicy('off'), 'off');
+  assert.equal(normalizeCommandPolicy(' OPEN '), 'open');
+  assert.equal(commandPolicyFromEnv({ OSCAR_COMMAND_POLICY: 'off' }), 'off');
 });
 
 await test('the stored setting is read back', async () => {

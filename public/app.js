@@ -90,6 +90,8 @@ const el = {
   setDetailed: $('set-detailed'),
   setModel: $('set-model'),
   setTiming: $('set-timing'),
+  setCommandPolicy: $('set-command-policy'),
+  commandPolicyNote: $('command-policy-note'),
   setCatching: $('set-catching'),
   catchingNote: $('catching-note'),
 
@@ -182,6 +184,85 @@ for (const [key, control] of [
     applySettings();
   });
 }
+
+/* ======================================================= command policy */
+
+/**
+ * Whether Oscar may run anything on this machine, and whether it asks first.
+ *
+ * Server-side for the same reason background catching is: the laptop polling
+ * for work at three in the morning cannot read this browser, and neither can
+ * the Shortcut. The runner picks the answer up on its next poll, which is
+ * within a few seconds — there is nothing to restart.
+ *
+ * Starts disabled and is only enabled once the server has said what is
+ * actually stored. A control you can change before anyone knows its state is
+ * a control that lies to you for a second, and this is not the setting to be
+ * casual about.
+ */
+let commandPolicy = null;
+
+const COMMAND_POLICY_NOTES = {
+  off: 'Off. Oscar cannot run anything on your computer, and will say so if asked.',
+  confirm:
+    'Every command asks first. You get a notification, and nothing runs until you say yes.',
+  open:
+    'Commands run without asking. Your computer still refuses the catastrophic ones — that is not a setting.',
+};
+
+function sayCommandPolicy(text, state) {
+  el.commandPolicyNote.textContent = text;
+  if (state) el.commandPolicyNote.dataset.state = state;
+  else delete el.commandPolicyNote.dataset.state;
+}
+
+function showCommandPolicy(policy, note) {
+  commandPolicy = policy;
+  el.setCommandPolicy.value = policy;
+  sayCommandPolicy(note || COMMAND_POLICY_NOTES[policy] || policy);
+}
+
+async function loadCommandPolicy() {
+  el.setCommandPolicy.disabled = true;
+  try {
+    const { data } = await api('/api/settings');
+    if (!data || !data.ok) throw new Error(data && data.error);
+
+    showCommandPolicy(data.commandPolicy);
+
+    if (!data.storable) {
+      sayCommandPolicy(
+        'No database is configured, so there is nowhere to save this. It is fixed by OSCAR_COMMAND_POLICY.'
+      );
+      return;
+    }
+
+    el.setCommandPolicy.disabled = false;
+  } catch (err) {
+    sayCommandPolicy(`Could not read this setting: ${(err && err.message) || err}`, 'bad');
+  }
+}
+
+el.setCommandPolicy.addEventListener('change', async () => {
+  const wanted = el.setCommandPolicy.value;
+  const previous = commandPolicy;
+
+  el.setCommandPolicy.disabled = true;
+  sayCommandPolicy('Saving…', 'saving');
+
+  try {
+    const { data } = await api('/api/settings', { commandPolicy: wanted });
+    if (!data || !data.ok) throw new Error((data && data.error) || 'it was not saved');
+    showCommandPolicy(data.commandPolicy);
+  } catch (err) {
+    // Put the control back to what is actually stored. Showing a policy the
+    // server never accepted is worse than showing an error.
+    if (previous !== null) showCommandPolicy(previous);
+    sayCommandPolicy(`Not saved: ${(err && err.message) || err}`, 'bad');
+  } finally {
+    el.setCommandPolicy.disabled = false;
+  }
+});
 
 /* =================================================== background catching */
 
@@ -445,6 +526,7 @@ async function enterConsole(email) {
   // the login screen has none. Not awaited either — the Settings tab is not
   // what anyone opens the page for.
   loadCatching().catch(() => {});
+  loadCommandPolicy().catch(() => {});
 
   // This one IS the greeting the whole feature exists for — a suspended run is
   // going nowhere until it is answered.
