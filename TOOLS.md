@@ -81,6 +81,48 @@ Current conditions and up to seven days of forecast.
 
 ---
 
+## Public lookups
+
+Three read-only tools for finding out who a username belongs to, from profiles
+people published themselves. They need no key and change nothing, so they sit
+alongside the weather rather than behind the write gate.
+
+### `find_username`
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `username` | string, required | The handle. A leading `@`, or a pasted profile URL, is fine. |
+| `sites` | array, optional | Restrict to particular sites. Omit to check all eleven. |
+
+Returns `found`, `unknown` and `absent`, plus `notChecked` for the sites that
+cannot be probed at all. The three states are the point: a site that could not be
+reached is reported as unknown rather than being rounded down to "no account".
+
+### `lookup_profile`
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `site` | string, required | One of the catalogue ids. |
+| `username` | string, required | The handle on that site. |
+
+The read step after the search step. Adds recently-pushed repositories on GitHub.
+
+### `lookup_domain`
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `domain` | string, required | `example.com`. A full URL is trimmed down. |
+
+Registrar, registration and expiry dates, and nameservers, over RDAP. Registrant
+details are redacted on almost every domain since GDPR, and the result says so
+rather than implying the owner is hiding.
+
+**[OSINT.md](./OSINT.md) is the full account** — the catalogue, why three states
+instead of two, the sites that are deliberately not probed, and where the
+boundary is drawn.
+
+---
+
 ## How location is worked out
 
 Four sources, tried in order. The first that works wins:
@@ -101,7 +143,7 @@ wherever the exit node lives. Instructions are in
 
 ## Services used
 
-All three are free and need no API key, which is why the project still has no
+All of them are free and need no API key, which is why the project still has no
 signup requirements beyond OpenAI.
 
 | Service | Used for | Limits |
@@ -109,6 +151,8 @@ signup requirements beyond OpenAI.
 | [Open-Meteo](https://open-meteo.com) | Forecasts | 600/min, <10k/day, non-commercial |
 | [Open-Meteo Geocoding](https://open-meteo.com/en/docs/geocoding-api) | Place name → coordinates | Same |
 | [Nominatim](https://nominatim.openstreetmap.org) | Coordinates → city name | ~1 request/second, needs an identifying User-Agent |
+| Eleven public profile APIs | Username lookups | See [OSINT.md](./OSINT.md). GitHub's 60/hour is the only one you are likely to hit |
+| [rdap.org](https://rdap.org) | Domain registration records | Bootstrap redirector to each registry |
 
 ### The one that isn't here, and why
 
@@ -133,6 +177,8 @@ breaking the request.
 | `OSCAR_UNITS` | `imperial` | `imperial` = °F/mph/inches. `metric` = °C/km/h/mm. |
 | `OSCAR_HOME_LOCATION` | *(unset)* | Last-resort location, e.g. `Seattle, WA`. |
 | `OSCAR_DISABLE_TOOLS` | *(unset)* | `1` turns all tools off. Useful for isolating a problem. |
+| `OSCAR_DISABLE_OSINT` | *(unset)* | `1` withholds the three public-lookup tools. |
+| `OSCAR_GITHUB_TOKEN` | *(unset)* | Raises GitHub's rate limit for username lookups. Needs no scopes. |
 | `OSCAR_DISABLE_REVERSE_GEOCODE` | *(unset)* | `1` skips Nominatim. Answers say "your location" instead of naming a city. |
 
 ---

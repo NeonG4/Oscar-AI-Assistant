@@ -59,7 +59,13 @@ import {
   LocationError,
 } from '../lib/tools/location.js';
 import { describeCode, fetchWeather, unitSet, weatherTool } from '../lib/tools/weather.js';
-import { runTool, toolSchemas, isToolsEnabled, availableTools } from '../lib/tools/index.js';
+import {
+  runTool,
+  toolSchemas,
+  isToolsEnabled,
+  isOsintEnabled,
+  availableTools,
+} from '../lib/tools/index.js';
 import { planTasksTool, finishTaskTool } from '../lib/tools/checklist.js';
 import {
   activeTask,
@@ -210,6 +216,28 @@ import {
   forgetPersonTool,
   listPeopleTool,
 } from '../lib/tools/people.js';
+import {
+  BLOCKED_SITES,
+  SITES,
+  compact,
+  fetchProfile,
+  getSite,
+  isoDate,
+  justDate,
+  lookupDomain,
+  normalizeDomain,
+  normalizeUsername,
+  probeSite,
+  siteIds,
+  stripHtml,
+  sweepUsername,
+  OsintError,
+} from '../lib/osint.js';
+import {
+  findUsernameTool,
+  lookupProfileTool,
+  lookupDomainTool,
+} from '../lib/tools/osint.js';
 import {
   backoffDelay,
   errorDetail,
@@ -1289,9 +1317,12 @@ await test('schemas are shaped the way OpenAI expects', () => {
   // runner. The two lookups, plus the two task-list tools — which need nothing
   // at all, because the list lives inside the run's own state.
   assert.deepEqual(schemas.map((s) => s.function.name).sort(), [
+    'find_username',
     'finish_task',
     'get_location',
     'get_weather',
+    'lookup_domain',
+    'lookup_profile',
     'plan_tasks',
   ]);
 });
@@ -6681,5 +6712,405 @@ await test('a dead account fails fast and says which kind of 429 it is', async (
   assert.deepEqual(sleep.waits, []);
 });
 
+
+
+section('OSINT — reading a username');
+
+/**
+ * A fake internet. Keys are matched against the URL; the value is the response.
+ * Anything unrouted 404s, so each test only has to describe the site it cares
+ * about and every other site is a clean "no such user".
+ */
+function fakeInternet(routes = {}) {
+  const calls = [];
+  const reply = (status, body) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+
+  const fn = async (url) => {
+    calls.push(String(url));
+    for (const [pattern, handler] of Object.entries(routes)) {
+      if (String(url).includes(pattern)) {
+        if (handler === 'boom') throw new Error('connection reset');
+        return reply(handler.status, handler.body);
+      }
+    }
+    return reply(404, { message: 'Not Found' });
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const NO_ENV = {};
+
+await test('a username is normalised the way a person would write one', () => {
+  assert.equal(normalizeUsername('torvalds'), 'torvalds');
+  assert.equal(normalizeUsername('  @jack '), 'jack', 'a spoken handle keeps its @');
+  assert.equal(normalizeUsername('~pushcx'), 'pushcx', 'Lobsters writes handles with a tilde');
+  assert.equal(normalizeUsername('https://github.com/torvalds'), 'torvalds', 'a pasted profile URL');
+  assert.equal(normalizeUsername('github.com/torvalds/'), 'torvalds');
+  assert.equal(normalizeUsername('Bob_1.x-y'), 'Bob_1.x-y');
+});
+
+await test('anything that is not a username is refused, not guessed at', () => {
+  const bad = ['', '   ', '../../etc/passwd', 'a b', 'user@evil.com', 'x'.repeat(41), 'a%2fb', 'a?b=c', 'a#b', '-leading'];
+  for (const value of bad) {
+    assert.throws(() => normalizeUsername(value), OsintError, `should have refused ${JSON.stringify(value)}`);
+  }
+});
+
+await test('every probe URL stays on the host the catalogue chose', async () => {
+  // The security property. The username is interpolated into URLs we then
+  // fetch server-side, so it must never be able to move a request to a host of
+  // its own choosing. normalizeUsername bars the characters that could do it,
+  // and encodeURIComponent covers whatever it lets through.
+  const doFetch = fakeInternet();
+  await sweepUsername('a.b-c_1', {}, { fetchImpl: doFetch, env: NO_ENV });
+
+  const allowed = new Set([
+    'api.github.com',
+    'gitlab.com',
+    'hacker-news.firebaseio.com',
+    'keybase.io',
+    'mastodon.social',
+    'public.api.bsky.app',
+    'lobste.rs',
+    'dev.to',
+    'hub.docker.com',
+    'api.chess.com',
+    'registry.npmjs.org',
+  ]);
+  const hosts = new Set(doFetch.calls.map((url) => new URL(url).host));
+  for (const host of hosts) assert.ok(allowed.has(host), `unexpected host contacted: ${host}`);
+  assert.equal(doFetch.calls.length, SITES.length, 'every catalogue site asked exactly once');
+});
+
+await test('a 200 is found and a 404 is absent', async () => {
+  const doFetch = fakeInternet({
+    'api.github.com': { status: 200, body: { login: 'torvalds', name: 'Linus Torvalds' } },
+  });
+  const found = await probeSite(getSite('github'), 'torvalds', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(found.state, 'found');
+  assert.equal(found.profile.displayName, 'Linus Torvalds');
+  assert.equal(found.url, 'https://github.com/torvalds', 'the human URL, not the API one');
+
+  const missing = await probeSite(getSite('github'), 'nobody', { fetchImpl: fakeInternet(), env: NO_ENV });
+  assert.equal(missing.state, 'absent');
+});
+
+await test('a rate limit is unknown, never absent — the whole point of three states', async () => {
+  const doFetch = fakeInternet({ 'api.github.com': { status: 403, body: { message: 'rate limit exceeded' } } });
+  const out = await probeSite(getSite('github'), 'torvalds', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.state, 'unknown', 'a 403 must not be reported as "no such account"');
+  assert.match(out.reason, /rate-limited/i);
+});
+
+await test('a site that never answers is unknown, not absent', async () => {
+  const out = await probeSite(getSite('github'), 'torvalds', {
+    fetchImpl: fakeInternet({ 'api.github.com': 'boom' }),
+    env: NO_ENV,
+  });
+  assert.equal(out.state, 'unknown');
+  assert.match(out.reason, /could not be reached/);
+});
+
+await test('the sites that answer 200 to everything are read properly', async () => {
+  // Each of these would be misread by status-code-only logic, which is exactly
+  // why they carry their own decide().
+  const cases = [
+    ['gitlab', 'gitlab.com', { status: 200, body: [] }, 'absent'],
+    ['gitlab', 'gitlab.com', { status: 200, body: [{ name: 'Linus', web_url: 'x' }] }, 'found'],
+    ['hackernews', 'firebaseio', { status: 200, body: null }, 'absent'],
+    ['hackernews', 'firebaseio', { status: 200, body: { karma: 100, created: 1160418092 } }, 'found'],
+    ['keybase', 'keybase.io', { status: 200, body: { status: { code: 205 } } }, 'absent'],
+    ['keybase', 'keybase.io', { status: 200, body: { status: { code: 0 }, them: {} } }, 'found'],
+    ['bluesky', 'bsky.app', { status: 400, body: { error: 'InvalidRequest', message: 'Profile not found' } }, 'absent'],
+    ['bluesky', 'bsky.app', { status: 200, body: { handle: 'x.bsky.social' } }, 'found'],
+  ];
+  for (const [id, host, response, expected] of cases) {
+    const out = await probeSite(getSite(id), 'someone', {
+      fetchImpl: fakeInternet({ [host]: response }),
+      env: NO_ENV,
+    });
+    assert.equal(out.state, expected, `${id} answering ${JSON.stringify(response.body)} should be ${expected}`);
+  }
+});
+
+await test('npm having no packages is unknown, because it cannot see accounts', async () => {
+  const empty = await probeSite(getSite('npm'), 'someone', {
+    fetchImpl: fakeInternet({ 'registry.npmjs.org': { status: 200, body: { objects: [], total: 0 } } }),
+    env: NO_ENV,
+  });
+  assert.equal(empty.state, 'unknown', 'no packages does not mean no account');
+  assert.match(empty.reason, /may still exist/);
+
+  const published = await probeSite(getSite('npm'), 'someone', {
+    fetchImpl: fakeInternet({
+      'registry.npmjs.org': { status: 200, body: { objects: [{ package: { name: 'got' } }], total: 1 } },
+    }),
+    env: NO_ENV,
+  });
+  assert.equal(published.state, 'found');
+  assert.deepEqual(published.profile.examples, ['got']);
+});
+
+await test('a GitHub token is used when set, and not invented when it is not', async () => {
+  const seen = [];
+  const doFetch = async (url, init) => {
+    seen.push((init.headers || {}).authorization);
+    return { ok: true, status: 200, text: async () => '{}' };
+  };
+  await probeSite(getSite('github'), 'x', { fetchImpl: doFetch, env: { OSCAR_GITHUB_TOKEN: 'ghp_secret' } });
+  await probeSite(getSite('github'), 'x', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(seen[0], 'Bearer ghp_secret');
+  assert.equal(seen[1], undefined, 'no token configured means no authorization header');
+});
+
+await test('a summariser that trips over an odd payload still reports the hit', async () => {
+  const doFetch = fakeInternet({ 'mastodon.social': { status: 200, body: { fields: 'not-an-array' } } });
+  const out = await probeSite(getSite('mastodon'), 'x', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.state, 'found', 'the account exists whether or not we could describe it');
+});
+
+await test('the sweep sorts hits first and never claims more than it knows', async () => {
+  const doFetch = fakeInternet({
+    'api.github.com': { status: 200, body: { login: 'x', name: 'Ex Ample', blog: 'https://ex.test' } },
+    'api.chess.com': { status: 200, body: { name: 'Ex' } },
+    'keybase.io': { status: 500, body: 'server error' },
+  });
+  const out = await sweepUsername('@torvalds', {}, { fetchImpl: doFetch, env: NO_ENV });
+
+  assert.equal(out.username, 'torvalds');
+  assert.deepEqual(out.found.map((f) => f.site), ['chess', 'github'], 'found, sorted, first');
+  assert.ok(out.unknown.some((u) => u.site === 'keybase'), 'a 500 belongs in unknown');
+  assert.ok(out.absent.includes('devto'), 'a 404 from a site that 404s means absent');
+  // GitLab always answers 200 in real life, so a 404 from it is not a "no" —
+  // it is a site behaving unexpectedly, and that belongs in unknown.
+  assert.ok(out.unknown.some((u) => u.site === 'gitlab'));
+  assert.match(out.summary, /does not prove it is the same person/);
+});
+
+await test('the sweep can be pointed at a single site', async () => {
+  const doFetch = fakeInternet({ 'api.github.com': { status: 200, body: { login: 'x' } } });
+  const out = await sweepUsername('torvalds', { sites: ['github'] }, { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(doFetch.calls.length, 1);
+  assert.equal(out.found[0].site, 'github');
+});
+
+await test('asking for a site that is not in the catalogue says which ones are', async () => {
+  await assert.rejects(
+    () => sweepUsername('torvalds', { sites: ['myspace'] }, { fetchImpl: fakeInternet(), env: NO_ENV }),
+    (err) => err instanceof OsintError && /github/.test(err.message)
+  );
+});
+
+await test('sites that cannot be probed are handed over, and never fetched', async () => {
+  const doFetch = fakeInternet();
+  const out = await sweepUsername('torvalds', {}, { fetchImpl: doFetch, env: NO_ENV });
+
+  const ids = out.notChecked.map((s) => s.site);
+  assert.ok(ids.includes('reddit') && ids.includes('linkedin') && ids.includes('pypi'));
+  for (const entry of out.notChecked) {
+    assert.ok(entry.url && entry.why, 'a site we refuse to check needs a link and a reason');
+  }
+  // The other half of refusing to guess is refusing to ask.
+  const contacted = doFetch.calls.join(' ');
+  for (const blocked of BLOCKED_SITES) {
+    const host = new URL(blocked.profile('torvalds')).host;
+    assert.ok(!contacted.includes(host), `${blocked.id} must never be fetched`);
+  }
+});
+
+await test('Keybase proofs come back, being the one real cross-site link', async () => {
+  const doFetch = fakeInternet({
+    'keybase.io': {
+      status: 200,
+      body: {
+        status: { code: 0 },
+        them: {
+          basics: { ctime: 1573862400 },
+          profile: { full_name: 'Ex Ample', location: 'Oslo', bio: '<p>Hi &amp; hello</p>' },
+          proofs_summary: {
+            all: [
+              { proof_type: 'github', nametag: 'exampl', service_url: 'https://github.com/exampl' },
+              { proof_type: 'twitter', nametag: 'ex', service_url: 'https://twitter.com/ex' },
+            ],
+          },
+        },
+      },
+    },
+  });
+  const out = await probeSite(getSite('keybase'), 'exampl', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.profile.fullName, 'Ex Ample');
+  assert.equal(out.profile.bio, 'Hi & hello', 'HTML and entities are flattened');
+  assert.equal(out.profile.joined, '2019-11-16');
+  assert.deepEqual(out.profile.provenAccounts.map((p) => p.service), ['github', 'twitter']);
+});
+
+await test('lookup_profile goes back for depth the sweep did not fetch', async () => {
+  const doFetch = fakeInternet({
+    '/repos?': {
+      status: 200,
+      body: [
+        { name: 'linux', language: 'C', stargazers_count: 5, pushed_at: '2026-08-01T00:00:00Z', fork: false },
+      ],
+    },
+    'api.github.com': { status: 200, body: { login: 'torvalds', name: 'Linus Torvalds' } },
+  });
+  const out = await fetchProfile('github', 'torvalds', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.state, 'found');
+  assert.deepEqual(out.recentRepos[0], { name: 'linux', language: 'C', stars: 5, lastPush: '2026-08-01' });
+});
+
+await test('losing the depth request does not lose the profile', async () => {
+  const doFetch = fakeInternet({
+    '/repos?': 'boom',
+    'api.github.com': { status: 200, body: { login: 'torvalds', name: 'Linus Torvalds' } },
+  });
+  const out = await fetchProfile('github', 'torvalds', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.state, 'found');
+  assert.equal(out.profile.displayName, 'Linus Torvalds');
+  assert.equal(out.recentRepos, undefined);
+});
+
+await test('the profile tool spells out what absent and unknown mean', async () => {
+  const absent = await lookupProfileTool.run(
+    { site: 'github', username: 'nobody' },
+    { fetchImpl: fakeInternet(), env: NO_ENV }
+  );
+  assert.match(absent.note, /no GitHub account/);
+
+  const unknown = await lookupProfileTool.run(
+    { site: 'github', username: 'someone' },
+    { fetchImpl: fakeInternet({ 'api.github.com': { status: 403, body: {} } }), env: NO_ENV }
+  );
+  assert.match(unknown.note, /not evidence either way/i);
+});
+
+section('OSINT — domains');
+
+await test('a domain is normalised out of whatever was pasted', () => {
+  assert.equal(normalizeDomain('Example.COM'), 'example.com');
+  assert.equal(normalizeDomain('https://www.example.com/a/b?c=d'), 'example.com');
+  assert.equal(normalizeDomain('someone@example.com'), 'example.com');
+  assert.equal(normalizeDomain('example.com.'), 'example.com');
+  for (const bad of ['', 'not a domain', 'localhost', 'http://', '.com']) {
+    assert.throws(() => normalizeDomain(bad), OsintError);
+  }
+});
+
+await test('an RDAP record is flattened into the parts a person asks about', async () => {
+  const doFetch = fakeInternet({
+    'rdap.org': {
+      status: 200,
+      body: {
+        events: [
+          { eventAction: 'registration', eventDate: '2007-10-09T18:20:50Z' },
+          { eventAction: 'expiration', eventDate: '2026-10-09T07:00:00Z' },
+        ],
+        status: ['client transfer prohibited'],
+        nameservers: [{ ldhName: 'NS1.EXAMPLE.NET' }],
+        entities: [
+          { roles: ['registrar'], vcardArray: ['vcard', [['fn', {}, 'text', 'MarkMonitor Inc.']]] },
+        ],
+      },
+    },
+  });
+  const out = await lookupDomain('https://github.com/foo', { fetchImpl: doFetch, env: NO_ENV });
+  assert.equal(out.domain, 'github.com');
+  assert.equal(out.registrar, 'MarkMonitor Inc.');
+  assert.equal(out.created, '2007-10-09');
+  assert.equal(out.expires, '2026-10-09');
+  assert.deepEqual(out.nameservers, ['NS1.EXAMPLE.NET']);
+  assert.match(out.note, /redacted/, 'a redacted record should say that this is normal');
+});
+
+await test('an unregistered domain says so instead of failing', async () => {
+  const out = await lookupDomainTool.run(
+    { domain: 'nobody-owns-this.com' },
+    { fetchImpl: fakeInternet(), env: NO_ENV }
+  );
+  assert.equal(out.registered, false);
+  assert.match(out.note, /not registered/);
+});
+
+await test('a registry that breaks gives a readable error, not a stack trace', async () => {
+  await assert.rejects(
+    () =>
+      lookupDomain('example.com', {
+        fetchImpl: fakeInternet({ 'rdap.org': { status: 500, body: 'nope' } }),
+        env: NO_ENV,
+      }),
+    (err) => err instanceof OsintError && /HTTP 500/.test(err.message)
+  );
+});
+
+section('OSINT — plumbing');
+
+await test('the small helpers behave', () => {
+  assert.equal(stripHtml('<p>a<br>b</p>'), 'a b');
+  assert.equal(stripHtml('&lt;tag&gt; &amp; &#39;quote&#39;'), '<tag> & \'quote\'');
+  assert.equal(stripHtml(null), null);
+  assert.equal(stripHtml('x'.repeat(500)).length, 400, 'long bios are trimmed');
+
+  assert.equal(isoDate(1160418092), '2006-10-09');
+  assert.equal(isoDate(1160418092000), '2006-10-09', 'milliseconds are detected');
+  assert.equal(isoDate(0), null);
+  assert.equal(isoDate('nonsense'), null);
+
+  assert.equal(justDate('2011-09-03T15:26:22Z'), '2011-09-03');
+  assert.equal(justDate(''), null);
+
+  assert.deepEqual(compact({ a: 1, b: null, c: '', d: [], e: '  x  ', f: undefined }), { a: 1, e: 'x' });
+});
+
+await test('the catalogue is internally consistent', () => {
+  const ids = siteIds();
+  assert.equal(new Set(ids).size, ids.length, 'site ids must be unique');
+  for (const site of SITES) {
+    assert.ok(site.label && typeof site.probe === 'function' && typeof site.profile === 'function');
+    assert.ok(getSite(site.id) === site);
+    assert.match(site.profile('someone'), /^https:\/\//);
+  }
+  for (const blocked of BLOCKED_SITES) {
+    assert.ok(!ids.includes(blocked.id), `${blocked.id} cannot be both probed and blocked`);
+  }
+});
+
+await test('the OSINT tools are read-only and can be switched off', () => {
+  for (const tool of [findUsernameTool, lookupProfileTool, lookupDomainTool]) {
+    assert.ok(!tool.writes, `${tool.name} must not need write authority`);
+    assert.ok(!tool.confirm, `${tool.name} changes nothing, so it must not ask to confirm`);
+  }
+  assert.equal(isOsintEnabled({}), true);
+  assert.equal(isOsintEnabled({ OSCAR_DISABLE_OSINT: '1' }), false);
+
+  const on = toolSchemas({}, {}).map((s) => s.function.name);
+  assert.ok(on.includes('find_username'));
+
+  const off = toolSchemas({}, { OSCAR_DISABLE_OSINT: '1' }).map((s) => s.function.name);
+  for (const name of ['find_username', 'lookup_profile', 'lookup_domain']) {
+    assert.ok(!off.includes(name), `${name} should be withheld`);
+  }
+  assert.ok(off.includes('get_weather'), 'switching OSINT off must not disturb anything else');
+});
+
+await test('a withheld OSINT tool is refused at the gate too', async () => {
+  const out = await runTool('find_username', '{"username":"torvalds"}', {
+    env: { OSCAR_DISABLE_OSINT: '1' },
+  });
+  assert.match(out.error, /not available/);
+});
+
+await test('a bad username reaches the model as a readable error, not a crash', async () => {
+  const out = await runTool('find_username', '{"username":"../../etc/passwd"}', {
+    fetchImpl: fakeInternet(),
+    env: NO_ENV,
+  });
+  assert.ok(!out.result);
+  assert.match(out.error, /does not look like a username/);
+});
 
 console.log(`\n${passed} passing${process.exitCode ? ' — WITH FAILURES' : ''}\n`);

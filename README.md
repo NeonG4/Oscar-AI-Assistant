@@ -64,6 +64,8 @@ for an answer written to fit on a lock screen.
 | `lib/tools/plans.js`    | Your plans: goals broken into ordered steps you can tick off.          |
 | `lib/plans.js`          | Plan storage in Supabase. Owned data, not someone else's API.          |
 | `lib/tools/people.js`   | The people you know: save, look up, and forget one.                    |
+| `lib/tools/osint.js`    | Who a username belongs to, from public profiles only.                  |
+| `lib/osint.js`          | The site catalogue, the three-state probe, and RDAP.                   |
 | `lib/people.js`         | People storage in Supabase, and the rules for merging into a person.   |
 | `lib/catch.js`          | Background catching: noticing the people you mention, without asking.  |
 | `lib/settings.js`       | Settings that must hold everywhere — the Shortcut, jobs, the laptop.   |
@@ -95,6 +97,7 @@ for an answer written to fit on a lock screen.
 | `PUSH.md`           | **Notifications on your phone.** Includes the iOS Home Screen trap.        |
 | `MISSIONS.md`       | **Work that plans itself, then does itself.** Goal in, program out.        |
 | `QUESTIONS.md`      | **When Oscar doesn't know.** Pausing to ask, and resuming on your answer.  |
+| `OSINT.md`          | **Looking someone up from public profiles.** Where the boundary is.        |
 
 ## Setup
 

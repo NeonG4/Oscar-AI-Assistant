@@ -665,6 +665,32 @@ Set to `1` to stop offering tools to the model at all. Oscar goes back to
 answering purely from what the model knows. Useful for working out whether a bad
 answer is the tools' fault.
 
+### `OSCAR_DISABLE_OSINT` — optional
+
+Set to `1` to withhold the three public-lookup tools — `find_username`,
+`lookup_profile` and `lookup_domain`. Everything else keeps working.
+
+They need no key and change nothing, so they are on by default. The reason to
+turn them off is that they reach out to about a dozen third-party APIs from your
+deployment's IP address, and not every network wants that traffic. See
+`OSINT.md`.
+
+### `OSCAR_GITHUB_TOKEN` — optional
+
+A GitHub personal access token, used only to raise the rate limit on GitHub
+lookups. Unauthenticated the API allows 60 requests an hour **per IP**, which on
+a shared serverless host you can burn through without doing anything wrong; with
+a token it is 5,000.
+
+Create one at **GitHub → Settings → Developer settings → Personal access tokens
+→ Fine-grained tokens**, and give it **no scopes at all**. It never needs any:
+every endpoint used here is public, and the token is only ever a way of saying
+who is counting. A token with no permissions cannot touch your account even if
+the deployment leaks it.
+
+Without it, a rate-limited GitHub lookup is reported as `unknown` rather than
+being mistaken for "no such account", so nothing breaks — you just learn less.
+
 ### `OSCAR_BACKGROUND_CATCHING` — optional
 
 **Default:** unset, which means **off**.
