@@ -34,8 +34,7 @@ for an answer written to fit on a lock screen.
 | File                | Role                                                                     |
 | ------------------- | ------------------------------------------------------------------------ |
 | `api/ask.js`        | The endpoint the Shortcut hits. Accepts a session cookie **or** the key.  |
-| `api/auth.js`       | Login: password → emailed code → session cookie. Also logout.             |
-| `api/session.js`    | "Am I signed in?" — the page asks this on load.                          |
+| `api/auth.js`       | Login: password → emailed code → session cookie. Also logout, and "am I signed in?". |
 | `api/confirm.js`    | Phase two of a destructive action: verify the token, then act.             |
 | `api/jobs.js`       | Background jobs: status, live tool trace, answer — and removing one.      |
 | `api/step.js`       | Advances one job per invocation. This is what removes the 60s ceiling.    |
@@ -70,6 +69,8 @@ for an answer written to fit on a lock screen.
 | `lib/catch.js`          | Background catching: noticing the people you mention, without asking.  |
 | `lib/settings.js`       | Settings that must hold everywhere — the Shortcut, jobs, the laptop.   |
 | `api/settings.js`       | Read and change those settings. Session login only.                    |
+| `lib/mcp/`             | MCP servers you connected: the wire, the rows, and the access model.   |
+| `api/mcp.js`            | Connect a server and decide what each of its tools may do.             |
 | `lib/tools/index.js`    | Tool registry, and the write-permission gate.                          |
 | `lib/tools/shell.js`    | `run_cmd` / `check_cmd`: commands queued for your own computer.        |
 | `lib/commands.js`       | The command queue. Your laptop polls it; nothing ever calls in.        |

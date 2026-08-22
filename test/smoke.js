@@ -220,7 +220,6 @@ import jobsHandler from '../api/jobs.js';
 import confirmHandler from '../api/confirm.js';
 import historyHandler from '../api/history.js';
 import authHandler from '../api/auth.js';
-import sessionHandler from '../api/session.js';
 import {
   cleanName,
   findPerson,
@@ -730,17 +729,24 @@ await test('logout clears the cookie', async () => {
   assert.match(res.headers['set-cookie'], /Max-Age=0/);
 });
 
-await test('/api/session reports the signed-in state', async () => {
+await test('a GET on /api/auth reports the signed-in state', async () => {
+  // This used to be api/session.js. It was folded in here when /api/mcp put the
+  // project one over Vercel's twelve-function Hobby limit — the two did the
+  // same job, so the merge cost nothing. It must keep answering rather than
+  // refusing: the page asks it before it knows whether anyone is signed in.
   setEnv();
   const anon = fakeRes();
-  sessionHandler(fakeReq({ method: 'GET', url: '/api/session' }), anon);
+  await authHandler(fakeReq({ method: 'GET', url: '/api/auth' }), anon);
+  assert.equal(anon.statusCode, 200);
   assert.equal(anon.json().authed, false);
+  assert.equal(anon.json().email, null);
 
   const cookie = `oscar_session=${createSession('owner@example.com', SECRET)}`;
   const authed = fakeRes();
-  sessionHandler(fakeReq({ method: 'GET', url: '/api/session', cookie }), authed);
+  await authHandler(fakeReq({ method: 'GET', url: '/api/auth', cookie }), authed);
   assert.equal(authed.json().authed, true);
   assert.equal(authed.json().email, 'ow***@example.com');
+  assert.ok(authed.json().expiresAt, 'the page is told when the session runs out');
 });
 
 /* ============================================================== ask handler */

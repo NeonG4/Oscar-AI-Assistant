@@ -1,8 +1,9 @@
 /**
  * api/auth.js
  * ----------------------------------------------------------------------------
- * The login endpoint. Three actions on one route.
+ * The login endpoint. Everything about who you are, on one route.
  *
+ *   GET                                          → "am I signed in?"
  *   POST { action: "start",  password }          → emails a code, returns a challenge
  *   POST { action: "verify", challenge, code }   → sets the session cookie
  *   POST { action: "logout" }                    → clears the session cookie
@@ -10,6 +11,17 @@
  * Responses never distinguish "wrong password" from "unknown user" in a way
  * that leaks anything, and every failure path is delayed slightly to blunt
  * scripted guessing.
+ *
+ * THE GET USED TO BE ITS OWN FILE, api/session.js, which did exactly what
+ * `action: "status"` already did here. Folding it in cost nothing and bought a
+ * slot back: Vercel's Hobby plan allows twelve serverless functions per
+ * deployment, one file each, and adding /api/mcp put this project at thirteen.
+ *
+ * That is the constraint to remember before adding an endpoint. The next one
+ * does not fit either, and the answer then is a single catch-all route that
+ * dispatches internally — not another round of merging things that do not
+ * belong together. Reading the cookie is genuinely this file's job; almost
+ * nothing else would be.
  */
 
 import {
@@ -39,8 +51,25 @@ export default async function handler(req, res) {
     res.statusCode = 204;
     return res.end();
   }
+  // "Am I signed in?", which the page asks on load to decide whether to draw
+  // the login card or the console. A GET rather than an action on the POST
+  // body, because the page script cannot read the HttpOnly cookie itself and
+  // this is the cheapest possible way to ask the server what it sees.
+  //
+  // Deliberately never fails: an unsigned request is a perfectly good answer of
+  // `authed: false`, not a 401.
+  if (req.method === 'GET') {
+    const session = getSession(req);
+    return send(res, 200, {
+      ok: true,
+      authed: Boolean(session),
+      email: session ? maskEmail(session.sub) : null,
+      expiresAt: session ? new Date(session.exp).toISOString() : null,
+    });
+  }
+
   if (req.method !== 'POST') {
-    return send(res, 405, { ok: false, error: 'Use POST.' });
+    return send(res, 405, { ok: false, error: 'Use GET or POST.' });
   }
 
   let action = 'unknown';

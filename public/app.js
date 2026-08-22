@@ -11,7 +11,7 @@
  *
  * The session cookie is HttpOnly, so this script can't read it either. That's
  * deliberate: it means an XSS bug can't steal your session. We ask the server
- * "am I signed in?" via /api/session instead.
+ * "am I signed in?" via GET /api/auth instead.
  *
  * FOUR PANES, ONE AT A TIME
  *
@@ -874,7 +874,7 @@ async function init() {
   setState('loading');
 
   try {
-    const { data } = await api('/api/session');
+    const { data } = await api('/api/auth');
     if (data.authed) await enterConsole(data.email);
     else showGate();
   } catch {
