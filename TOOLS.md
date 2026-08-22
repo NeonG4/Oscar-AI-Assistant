@@ -14,6 +14,12 @@ Oscar can call out for live data and act on your behalf, instead of guessing.
 | `lib/tools/plans.js` | `create_plan`, `list_plans`, `get_plan`, `add_plan_steps`, `complete_plan_step`, `update_plan`, `delete_plan` |
 | `lib/tools/checklist.js` | `plan_tasks`, `finish_task` |
 
+That table is everything Oscar ships with. It is not everything he can hold:
+**an MCP server you connect on the settings page contributes tools too**, and
+those arrive at runtime from the database rather than from an import. They go
+through the same write gate as the ones above and one extra decision of their
+own — see [MCP.md](./MCP.md).
+
 The Google ones need [GOOGLE.md](./GOOGLE.md) set up first, and the plan ones
 need [SUPABASE.md](./SUPABASE.md); weather and location work out of the box. Anything that changes data is withheld unless the request
 proved write authority, and anything destructive asks first when dictated — see

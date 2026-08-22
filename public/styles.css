@@ -1183,3 +1183,157 @@ body[data-timing="off"] .meta-timing {
 .choice-note[data-state='bad'] {
   color: var(--bad);
 }
+
+
+/* ------------------------------------------------------- connected servers --
+   The MCP card. Its job is to make a permission decision per tool feel like
+   reading a list rather than filling in a form, because a server with fifteen
+   tools is fifteen decisions and anything heavier than a dropdown per row would
+   make people click "open" on all of them just to be finished. */
+
+.mcp-list {
+  display: grid;
+  gap: 10px;
+}
+
+.mcp-list:empty {
+  display: none;
+}
+
+.mcp-server {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+  background: var(--bg);
+}
+
+/* Switched off at the server level. Dimmed rather than hidden: a server you
+   silenced last month should still be findable when you want it back. */
+.mcp-server[data-off='1'] {
+  opacity: 0.55;
+}
+
+.mcp-server-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mcp-server-head b {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mcp-server-head .mcp-url {
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+  flex: 1 1 140px;
+}
+
+.mcp-server-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.mcp-status {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.mcp-status[data-state='bad'] {
+  color: var(--bad);
+}
+
+.mcp-tools {
+  display: grid;
+  gap: 0;
+}
+
+.mcp-tool {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.mcp-tool-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.mcp-tool-name b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+/* The server's own description, and — when it claims one — what it says about
+   itself. The claim is shown because it is useful and labelled because it is
+   not evidence: see lib/mcp/servers.js. */
+.mcp-tool-name em {
+  display: block;
+  margin-top: 1px;
+  font-size: 12px;
+  font-style: normal;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.mcp-tool select {
+  flex: 0 0 auto;
+  width: 118px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* Anything but `off` means the model can reach it, so the row it sits on says
+   so at a glance. Reading down a long list for the ones that are live is
+   exactly what this card is for. */
+.mcp-tool[data-live='1'] .mcp-tool-name b {
+  color: var(--accent);
+}
+
+.mcp-tool select:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.mcp-add {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.mcp-add summary {
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.mcp-add summary::-webkit-details-marker {
+  display: none;
+}
+
+.mcp-add summary::before {
+  content: '+ ';
+  color: var(--muted);
+}
+
+.mcp-add[open] summary::before {
+  content: '− ';
+}

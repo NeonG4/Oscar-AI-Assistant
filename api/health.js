@@ -22,7 +22,12 @@
 import { detectProvider } from '../lib/mailer.js';
 import { isConfigured, pingDatabase } from '../lib/db.js';
 import { isGoogleConfigured, canWriteGoogle, probeGoogle } from '../lib/google/auth.js';
-import { availableTools, isRunnerConfigured } from '../lib/tools/index.js';
+import {
+  availableTools,
+  isRunnerConfigured,
+  refreshRemoteTools,
+  remoteTools,
+} from '../lib/tools/index.js';
 import { isPushConfigured, vapidKeys } from '../lib/push.js';
 import { MAX_MISSION_STEPS } from '../lib/missions.js';
 import { routerModels, isRoutingEnabled } from '../lib/router.js';
@@ -40,6 +45,11 @@ export default async function handler(req, res) {
   const database = deep
     ? await pingDatabase()
     : { configured: isConfigured(env) };
+
+  // Costs one cached database read and no third-party traffic — the tool list
+  // is stored, not fetched — so unlike the Google and database probes below it
+  // does not need `deep` to earn its place.
+  await refreshRemoteTools(env);
 
   // Same bargain as `deep`, for Google: opt-in because it costs six round trips
   // to Google, and the page hits this endpoint on every load. See probeGoogle
@@ -159,6 +169,15 @@ export default async function handler(req, res) {
         tools: {
           readOnly: availableTools({ canWrite: false }, env).map((t) => t.name),
           withWrite: availableTools({ canWrite: true }, env).map((t) => t.name),
+          // Tools from connected MCP servers, listed separately because the two
+          // lists above answer "what can Oscar do" and this one answers "what
+          // did I let in" — which is the question you actually want a
+          // dependency-free URL to answer when something looks wrong.
+          //
+          // Each is named with the access level it was given, and the list only
+          // contains tools that survived it: anything set to `off` is absent
+          // here for the same reason it is absent from the model's tool list.
+          fromServers: remoteTools().map((t) => `${t.name} (${t.remote.access})`),
         },
       },
       null,

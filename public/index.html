@@ -287,6 +287,60 @@
           <p class="meta subtle choice-note" id="catching-note">Loading…</p>
         </section>
 
+        <!--
+          Where Oscar grows. Everything above changes how he behaves; this
+          changes what he is able to do at all, which is why it sits with the
+          command policy at the top of the pane rather than down with the
+          display switches.
+        -->
+        <section class="card" id="mcp-card" aria-labelledby="mcp-h">
+          <h2 id="mcp-h">Connected tools</h2>
+
+          <p class="meta subtle">
+            Point Oscar at an MCP server and its tools become his tools — no
+            deploy, no code. Nothing is switched on by connecting: every tool
+            arrives withheld until you choose what it may do.
+          </p>
+
+          <div id="mcp-servers" class="mcp-list"></div>
+
+          <details class="mcp-add" id="mcp-add-details">
+            <summary>Connect a server</summary>
+
+            <div class="field">
+              <label class="label" for="mcp-label">Name</label>
+              <input id="mcp-label" type="text" placeholder="Linear" autocomplete="off" />
+            </div>
+
+            <div class="field">
+              <label class="label" for="mcp-url">Server URL</label>
+              <input
+                id="mcp-url"
+                type="url"
+                placeholder="https://example.com/mcp"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+
+            <div class="field">
+              <label class="label" for="mcp-token">Access token (optional)</label>
+              <input
+                id="mcp-token"
+                type="password"
+                placeholder="Sent as a bearer token"
+                autocomplete="new-password"
+              />
+            </div>
+
+            <div class="actions">
+              <button id="mcp-connect" class="primary small" type="button">Connect</button>
+            </div>
+          </details>
+
+          <p class="meta subtle choice-note" id="mcp-note">Loading…</p>
+        </section>
+
         <section class="card" aria-labelledby="display-h">
           <h2 id="display-h">Display</h2>
 

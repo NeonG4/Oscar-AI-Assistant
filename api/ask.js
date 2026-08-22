@@ -35,6 +35,7 @@ import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
 import { applyCors, readBody, send, HttpError, clientIp } from '../lib/http.js';
 import { logConversation, conversationRow, conversationTurns, isConfigured } from '../lib/db.js';
 import { createConfirmToken, CONFIRM_TTL_MS } from '../lib/confirm.js';
+import { refreshRemoteTools } from '../lib/tools/index.js';
 import { catchPeople } from '../lib/catch.js';
 
 /**
@@ -280,6 +281,12 @@ export default async function handler(req, res) {
     const [route, history] = await Promise.all([
       routeQuestion(question, { env: process.env, mode: body.mode }),
       historyPromise,
+      // What the connected MCP servers currently offer. Needed HERE — before
+      // any state is built — because a background job's system prompt is
+      // written on this machine and then carried to another one, and a prompt
+      // that never mentioned the extra tools produces a model that denies
+      // having them. askAgent does the same thing for the inline path.
+      refreshRemoteTools(process.env),
     ]);
 
     const agentInput = {

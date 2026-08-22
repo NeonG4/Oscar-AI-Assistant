@@ -45,6 +45,7 @@ const routes = {
   '/api/runner': (await import('./api/runner.js')).default,
   '/api/questions': (await import('./api/questions.js')).default,
   '/api/settings': (await import('./api/settings.js')).default,
+  '/api/mcp': (await import('./api/mcp.js')).default,
 };
 
 const TYPES = {

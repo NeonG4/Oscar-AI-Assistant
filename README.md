@@ -92,6 +92,7 @@ for an answer written to fit on a lock screen.
 | `ENV.md`            | **Every environment variable, and how to obtain each one.**               |
 | `SUPABASE.md`       | **Setting up the database log.** Optional.                                |
 | `TOOLS.md`          | **How the tools work, and how to add your own.**                          |
+| `MCP.md`            | **Connecting an MCP server, so Oscar grows without a deploy.** Read the four access levels. |
 | `GOOGLE.md`         | **Connecting Gmail, Calendar, Tasks, Drive and Docs.** Includes the 7-day OAuth trap. |
 | `RUNNER.md`         | **Letting Oscar run commands on your own computer.** Read before enabling it. |
 | `PUSH.md`           | **Notifications on your phone.** Includes the iOS Home Screen trap.        |

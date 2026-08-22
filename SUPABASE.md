@@ -275,6 +275,39 @@ which he inferred.
 
 ---
 
+## Connected servers
+
+`db/schema.sql` also creates `mcp_servers`, which is what makes Oscar growable:
+each row is an MCP server you connected on the settings page, and its tools
+become his tools without a deploy. Re-run the schema file after pulling any
+update; every statement is idempotent.
+
+The column that matters is `access` — one level per tool, chosen by you, and
+every newly discovered tool starts at `off`. Connecting a server grants nothing
+by itself. `MCP.md` explains the four levels and why the server's own claims
+about its tools are shown to you but never acted on.
+
+```sql
+-- What Oscar is currently allowed to do beyond his built-in tools
+select label, key as tool, value as access
+from mcp_servers, jsonb_each_text(access)
+where enabled and value <> 'off' order by label, tool;
+
+-- Panic switch for one server, without opening the website
+update mcp_servers set enabled = false where label = 'Linear';
+
+-- Take everything back to withheld without disconnecting anything
+update mcp_servers
+set access = (select jsonb_object_agg(key, '"off"'::jsonb) from jsonb_each(access));
+```
+
+This table holds **bearer tokens for third-party services**, which is why it
+gets the same RLS lockdown as everything else here and why nothing in the API
+ever reads one back out — `/api/mcp` will tell you a token exists and let you
+replace it, and that is all.
+
+---
+
 ## What this unlocks next
 
 With a log table in place, the "learn about me" feature becomes tractable. The

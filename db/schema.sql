@@ -732,3 +732,123 @@ revoke all on public.people from anon, authenticated;
 -- Second thoughts about background catching? This forgets everything it ever
 -- collected on its own, and keeps everything you asked for:
 --   delete from public.people where source = 'background';
+
+
+-- ============================================================================
+--  MCP SERVERS — the tools Oscar was not shipped with
+--
+--  Every other capability in this system was decided by whoever wrote the code.
+--  A row in this table is a capability decided by whoever is using it: point
+--  Oscar at a Model Context Protocol server on the settings page and its tools
+--  become his tools, with no deploy and no code change.
+--
+--  THE `access` COLUMN IS THE SECURITY MODEL. EVERYTHING ELSE HERE IS PLUMBING.
+--
+--  Built-in tools are hand-labelled by someone who read what they do, and that
+--  labelling is what stops the read-only "Ask Oscar" Shortcut from sending mail
+--  or touching the laptop. A tool discovered over MCP arrives with none of it.
+--  MCP servers may declare annotations — readOnlyHint, destructiveHint — but
+--  they are declared by the server being gated, so Oscar records them, shows
+--  them to you, and decides nothing by them.
+--
+--  What decides is this column: one level per tool, chosen by you.
+--
+--    off    Withheld. The model is never told the tool exists. THE DEFAULT for
+--           every newly discovered tool — connecting a server grants nothing.
+--    ask    Offered, needs write authority, every call read back to you first.
+--    read   Offered to everything including the Shortcut, no confirmation.
+--           Only for tools you have checked cannot change anything.
+--    open   Offered with write authority, no confirmation. Acts immediately.
+--
+--  A refresh MERGES rather than replaces: a tool you set to `read` last week
+--  stays `read` when its description changes, and a tool that has appeared
+--  since arrives at `off` like any other new one. So a server cannot widen its
+--  own permissions by adding a tool and waiting for you to press Refresh.
+--
+--  `token` IS A CREDENTIAL AND NEVER LEAVES THE SERVER. /api/mcp reports
+--  `hasToken: true` and offers to replace it; there is no path that reads it
+--  back out. RLS below is what makes that stick.
+-- ============================================================================
+
+create table if not exists public.mcp_servers (
+  id           bigint generated always as identity primary key,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+
+  -- What you call it — "Linear", "my notes server". The slug is derived from
+  -- it once, at creation, and is what prefixes every tool name this server
+  -- contributes: `linear__create_issue`. Prefixing is not cosmetic. OpenAI tool
+  -- names have to be unique across the whole list, and nothing stops a remote
+  -- server from naming its tool `send_email` and shadowing yours.
+  label        text        not null,
+  slug         text        not null,
+
+  -- The streamable-HTTP endpoint. https, or http on localhost. See
+  -- lib/mcp/client.js — the older SSE transport and stdio are not supported.
+  url          text        not null,
+
+  -- Bearer token, if the server wants one. Server-side only, always.
+  token        text,
+
+  -- Off switch for the whole server, so you can silence one without losing the
+  -- per-tool decisions you made about it.
+  enabled      boolean     not null default true,
+
+  -- The last tools/list response, trimmed: name, description, input schema,
+  -- annotations. Cached rather than fetched per request because otherwise every
+  -- question you asked would begin with a handshake to every connected server.
+  tools        jsonb       not null default '[]',
+
+  -- { "<tool name>": "off" | "ask" | "read" | "open" }. See the header.
+  access       jsonb       not null default '{}',
+
+  -- What the server calls itself in its initialize response. Display only.
+  server_name  text,
+
+  refreshed_at timestamptz,
+
+  -- Why the last refresh failed, or null. What lets the settings page say "this
+  -- stopped answering on Tuesday" rather than showing an empty tool list and
+  -- letting you assume the server has nothing to offer.
+  last_error   text
+);
+
+comment on table public.mcp_servers is
+  'MCP servers connected from the settings page, and how far each of their tools is trusted.';
+
+-- One server per name. The slug is what tool names are built from, so two
+-- servers sharing one would produce two different tools with the same name —
+-- enforced here rather than hoped for in application code.
+create unique index if not exists mcp_servers_slug_idx
+  on public.mcp_servers (slug);
+
+-- ---------------------------------------------------------------------------
+--  Row Level Security — the same rule as every other table here, and this one
+--  holds bearer tokens for third-party services. RLS on, no policies: the anon
+--  key gets nothing, and only the service role key in your Vercel environment
+--  can read a row.
+-- ---------------------------------------------------------------------------
+
+alter table public.mcp_servers enable row level security;
+
+revoke all on public.mcp_servers from anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+--  Handy MCP queries
+-- ---------------------------------------------------------------------------
+
+-- What Oscar is currently allowed to do beyond his built-in tools:
+--   select label, key as tool, value as access
+--   from public.mcp_servers, jsonb_each_text(access)
+--   where enabled and value <> 'off' order by label, tool;
+
+-- Panic switch for one server, without opening the website:
+--   update public.mcp_servers set enabled = false where label = 'Linear';
+
+-- Panic switch for all of them. Note this leaves your per-tool decisions
+-- intact, so turning them back on does not mean setting them all up again:
+--   update public.mcp_servers set enabled = false;
+
+-- Take everything back to withheld without disconnecting anything:
+--   update public.mcp_servers
+--   set access = (select jsonb_object_agg(key, '"off"'::jsonb) from jsonb_each(access));

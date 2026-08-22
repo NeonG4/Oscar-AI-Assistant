@@ -25,7 +25,7 @@
 import { getSession, safeEqual, penaltyDelay } from '../lib/auth.js';
 import { applyCors, readBody, send, clientIp } from '../lib/http.js';
 import { readConfirmToken, isAffirmative, ConfirmError } from '../lib/confirm.js';
-import { runTool, getTool } from '../lib/tools/index.js';
+import { runTool, getTool, refreshRemoteTools } from '../lib/tools/index.js';
 import { logConversation, conversationRow } from '../lib/db.js';
 
 function authenticate(req, url, body) {
@@ -99,6 +99,12 @@ export default async function handler(req, res) {
         speak: 'No permission to make that change.',
       });
     }
+
+    // A confirmation can name a tool from a connected MCP server, and this is a
+    // different function invocation from the one that asked — so the remote
+    // list has to be loaded again before the lookup, or approving a remote
+    // action would report that Oscar has forgotten how to do it.
+    await refreshRemoteTools(process.env);
 
     const tool = getTool(pending.tool);
     if (!tool) {

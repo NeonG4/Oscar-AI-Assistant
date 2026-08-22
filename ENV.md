@@ -675,6 +675,17 @@ turn them off is that they reach out to about a dozen third-party APIs from your
 deployment's IP address, and not every network wants that traffic. See
 `OSINT.md`.
 
+### `OSCAR_DISABLE_MCP` — optional
+
+Set to `1` to ignore every MCP server you have connected, deployment-wide. The
+built-in tools keep working, and your connected servers — along with the
+per-tool access levels you chose for each — stay in the database untouched, so
+clearing this brings them all back exactly as they were.
+
+The blunt version of the **Pause** button on each server's card. Reach for that
+one to silence a single server; reach for this when you want them all gone
+without opening the website. See `MCP.md`.
+
 ### `OSCAR_GITHUB_TOKEN` — optional
 
 A GitHub personal access token, used only to raise the rate limit on GitHub

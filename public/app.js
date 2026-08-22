@@ -95,6 +95,15 @@ const el = {
   setCatching: $('set-catching'),
   catchingNote: $('catching-note'),
 
+  mcpCard: $('mcp-card'),
+  mcpServers: $('mcp-servers'),
+  mcpNote: $('mcp-note'),
+  mcpAddDetails: $('mcp-add-details'),
+  mcpLabel: $('mcp-label'),
+  mcpUrl: $('mcp-url'),
+  mcpToken: $('mcp-token'),
+  mcpConnect: $('mcp-connect'),
+
   recipe: $('recipe'),
   copy: $('copy'),
   endpoint: $('endpoint'),
@@ -346,6 +355,286 @@ el.setCatching.addEventListener('change', async () => {
   }
 });
 
+/* ======================================================= connected servers */
+
+/**
+ * The MCP card: where Oscar grows past the tools he shipped with.
+ *
+ * EVERY STRING DRAWN HERE CAME FROM SOMEBODY ELSE'S SERVER. Tool names,
+ * descriptions, the server's own name — all of it is third-party text arriving
+ * over an API, and it is written with textContent throughout, never innerHTML.
+ * That is not a style preference. A tool description is the one place in this
+ * console where a stranger controls what appears on the page, and building this
+ * list with string concatenation would put script injection one connected
+ * server away.
+ *
+ * The dropdown per tool is the whole security model made visible; see
+ * lib/mcp/servers.js for what the four levels mean and why the default is the
+ * one that grants nothing.
+ */
+
+let mcpLevels = [];
+let mcpStorable = true;
+
+function sayMcp(text, state) {
+  el.mcpNote.textContent = text;
+  if (state) el.mcpNote.dataset.state = state;
+  else delete el.mcpNote.dataset.state;
+}
+
+/** A short, honest line about what a server is currently doing for you. */
+function serverStatus(server) {
+  const tools = server.tools.length;
+  const live = Object.values(server.access).filter((level) => level !== 'off').length;
+
+  if (server.lastError) return { text: server.lastError, state: 'bad' };
+  if (!tools) return { text: 'No tools read yet. Try Refresh.', state: null };
+
+  const checked = server.refreshedAt ? `, checked ${formatWhen(server.refreshedAt)}` : '';
+  const availability = live
+    ? `${live} of ${tools} available to Oscar`
+    : `${tools} tools, none available yet — pick a level below`;
+
+  return { text: `${availability}${checked}.`, state: null };
+}
+
+function toolRow(server, tool) {
+  const level = server.access[tool.name] || 'off';
+
+  const row = document.createElement('div');
+  row.className = 'mcp-tool';
+  row.dataset.live = level === 'off' ? '0' : '1';
+
+  const name = document.createElement('div');
+  name.className = 'mcp-tool-name';
+
+  const title = document.createElement('b');
+  title.textContent = tool.name;
+  name.appendChild(title);
+
+  const notes = [];
+  if (tool.description) notes.push(String(tool.description).slice(0, 200));
+
+  // What the server claims about itself, phrased so it reads as a claim. Oscar
+  // does not act on these — see lib/mcp/servers.js — but "the server says this
+  // one only reads" is genuinely useful when you are deciding, so long as it is
+  // never mistaken for a guarantee.
+  const hints = tool.annotations || {};
+  if (hints.readOnlyHint === true) notes.push('The server says this one only reads.');
+  if (hints.destructiveHint === true) notes.push('The server says this one is destructive.');
+
+  if (notes.length) {
+    const detail = document.createElement('em');
+    detail.textContent = notes.join(' ');
+    name.appendChild(detail);
+  }
+
+  row.appendChild(name);
+
+  const select = document.createElement('select');
+  select.disabled = !mcpStorable;
+  for (const choice of mcpLevels) {
+    const option = document.createElement('option');
+    option.value = choice.level;
+    option.textContent = choice.level;
+    option.title = choice.description;
+    select.appendChild(option);
+  }
+  select.value = level;
+  select.title = (mcpLevels.find((c) => c.level === level) || {}).description || '';
+
+  select.addEventListener('change', async () => {
+    const wanted = select.value;
+    select.disabled = true;
+    sayMcp(`Setting ${tool.name} to ${wanted}…`, 'saving');
+    try {
+      const { data } = await api('/api/mcp', { id: server.id, access: { [tool.name]: wanted } });
+      if (!data || !data.ok) throw new Error((data && data.error) || 'it was not saved');
+      renderMcp(data);
+      sayMcp(`${tool.name} is now "${wanted}".`);
+    } catch (err) {
+      // Redraw from what the server actually holds. A dropdown showing a
+      // permission that was never stored is the worst possible lie for this
+      // particular control to tell.
+      sayMcp(`Not saved: ${(err && err.message) || err}`, 'bad');
+      loadMcp().catch(() => {});
+    }
+  });
+
+  row.appendChild(select);
+  return row;
+}
+
+function serverButton(text, handler, extra) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `ghost small${extra ? ` ${extra}` : ''}`;
+  button.textContent = text;
+  button.addEventListener('click', handler);
+  return button;
+}
+
+function serverCard(server) {
+  const card = document.createElement('div');
+  card.className = 'mcp-server';
+  card.dataset.off = server.enabled ? '0' : '1';
+
+  const head = document.createElement('div');
+  head.className = 'mcp-server-head';
+
+  const name = document.createElement('b');
+  name.textContent = server.label;
+  head.appendChild(name);
+
+  const url = document.createElement('span');
+  url.className = 'mcp-url';
+  url.textContent = server.url + (server.hasToken ? ' · authenticated' : '');
+  head.appendChild(url);
+
+  const actions = document.createElement('div');
+  actions.className = 'mcp-server-actions';
+
+  actions.appendChild(
+    serverButton('Refresh', () => mcpAction({ id: server.id, refresh: true }, 'Reading tools…'))
+  );
+
+  actions.appendChild(
+    serverButton(server.enabled ? 'Pause' : 'Resume', () =>
+      mcpAction(
+        { id: server.id, enabled: !server.enabled },
+        server.enabled ? 'Pausing…' : 'Resuming…'
+      )
+    )
+  );
+
+  actions.appendChild(
+    serverButton(
+      'Remove',
+      () => {
+        // The one destructive control on this card, and the only place in the
+        // console where a click loses something you cannot get back by clicking
+        // again — every access level you set for this server goes with it.
+        if (!confirm(`Disconnect "${server.label}"? Oscar loses its tools and your settings for them.`)) {
+          return;
+        }
+        mcpAction(null, 'Disconnecting…', `/api/mcp?id=${encodeURIComponent(server.id)}`);
+      },
+      'danger'
+    )
+  );
+
+  head.appendChild(actions);
+  card.appendChild(head);
+
+  const status = serverStatus(server);
+  const line = document.createElement('p');
+  line.className = 'mcp-status';
+  line.textContent = status.text;
+  if (status.state) line.dataset.state = status.state;
+  card.appendChild(line);
+
+  if (server.tools.length) {
+    const tools = document.createElement('div');
+    tools.className = 'mcp-tools';
+    for (const tool of server.tools) tools.appendChild(toolRow(server, tool));
+    card.appendChild(tools);
+  }
+
+  return card;
+}
+
+function renderMcp(data) {
+  mcpLevels = Array.isArray(data.accessLevels) ? data.accessLevels : mcpLevels;
+  mcpStorable = data.storable !== false;
+
+  el.mcpServers.replaceChildren();
+  for (const server of data.servers || []) el.mcpServers.appendChild(serverCard(server));
+
+  const count = (data.servers || []).length;
+  el.mcpConnect.disabled = !mcpStorable || count >= (data.maxServers || 8);
+
+  if (!mcpStorable) {
+    sayMcp(data.hint || 'No database is configured, so there is nowhere to keep a connected server.');
+    return;
+  }
+
+  if (data.enabled === false) {
+    sayMcp('Connected servers are switched off for this deployment by OSCAR_DISABLE_MCP.', 'bad');
+    return;
+  }
+
+  sayMcp(
+    count
+      ? 'off withholds a tool entirely. ask offers it and reads every call back to you first. read is for tools you have checked cannot change anything. open lets it act immediately.'
+      : 'Nothing connected. Add a server and its tools show up here, withheld until you say otherwise.'
+  );
+}
+
+/** One change, then redraw from whatever the server says is true afterwards. */
+async function mcpAction(body, saying, path) {
+  sayMcp(saying, 'saving');
+  try {
+    const { data } = await api(path || '/api/mcp', body, path ? 'DELETE' : undefined);
+    if (!data || !data.ok) throw new Error((data && data.error) || 'that did not work');
+    renderMcp(data);
+    // A reachable server that could not be listed is not a failed request — the
+    // row saved fine — so it is reported here rather than thrown above.
+    if (data.error) sayMcp(data.error, 'bad');
+    else if (data.removed) sayMcp(`Disconnected ${data.removed}.`);
+  } catch (err) {
+    sayMcp(`Failed: ${(err && err.message) || err}`, 'bad');
+  }
+}
+
+async function loadMcp() {
+  try {
+    const { data } = await api('/api/mcp');
+    if (!data || !data.ok) throw new Error(data && data.error);
+    renderMcp(data);
+  } catch (err) {
+    sayMcp(`Could not read your connected servers: ${(err && err.message) || err}`, 'bad');
+  }
+}
+
+el.mcpConnect.addEventListener('click', async () => {
+  const label = el.mcpLabel.value.trim();
+  const url = el.mcpUrl.value.trim();
+  const token = el.mcpToken.value.trim();
+
+  if (!label || !url) {
+    sayMcp('A server needs a name and a URL.', 'bad');
+    return;
+  }
+
+  el.mcpConnect.disabled = true;
+  sayMcp(`Connecting to ${label}…`, 'saving');
+
+  try {
+    const { data } = await api('/api/mcp', { label, url, token: token || undefined });
+    if (!data || !data.ok) throw new Error((data && data.error) || 'it did not connect');
+
+    renderMcp(data);
+    el.mcpLabel.value = '';
+    el.mcpUrl.value = '';
+    el.mcpToken.value = '';
+    el.mcpAddDetails.open = false;
+
+    const found = ((data.added && data.added.tools) || []).length;
+    if (data.error) sayMcp(`Saved, but: ${data.error}`, 'bad');
+    else {
+      sayMcp(
+        found
+          ? `${label} is connected with ${found} tools. All of them are withheld — set each one to "ask" or higher to let Oscar use it.`
+          : `${label} is connected, but offered no tools.`
+      );
+    }
+  } catch (err) {
+    sayMcp(`Could not connect: ${(err && err.message) || err}`, 'bad');
+  } finally {
+    el.mcpConnect.disabled = false;
+  }
+});
+
 /* ============================================================== login gate */
 
 let challenge = null;
@@ -529,6 +818,7 @@ async function enterConsole(email) {
   // what anyone opens the page for.
   loadCatching().catch(() => {});
   loadCommandPolicy().catch(() => {});
+  loadMcp().catch(() => {});
 
   // This one IS the greeting the whole feature exists for — a suspended run is
   // going nowhere until it is answered.
